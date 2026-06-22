@@ -145,7 +145,7 @@ func waitHTTP(ctx context.Context, t *testing.T, url string) {
 	t.Helper()
 	must := require.New(t)
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 		must.NoError(err)
 		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
@@ -179,7 +179,7 @@ func postJSON(ctx context.Context, t *testing.T, url string, v any) {
 func getJSON(ctx context.Context, t *testing.T, url string, v any) {
 	t.Helper()
 	must := require.New(t)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	must.NoError(err)
 	resp, err := http.DefaultClient.Do(req)
 	must.NoError(err)
