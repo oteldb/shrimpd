@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"golang.org/x/sync/errgroup"
 )
+
 
 func TestDaemonSmoke(t *testing.T) {
 	if testing.Short() {
@@ -731,3 +733,91 @@ func TestRecoveringNode(t *testing.T) {
 	stop1b()
 	_ = eg1b.Wait()
 }
+
+func TestShrimplyCLI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("E2E test for short testing")
+		return
+	}
+	must := require.New(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// Precompile shrimply binary
+	tmpBinDir := t.TempDir()
+	binaryPath := filepath.Join(tmpBinDir, "shrimply")
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/shrimply")
+	must.NoError(buildCmd.Run(), "failed to compile shrimply")
+
+	etcdEndpoint := startEtcd(ctx, t)
+	dataDir := t.TempDir()
+	must.NoError(os.MkdirAll(filepath.Join(dataDir, "parts"), 0o755))
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{etcdEndpoint},
+		DialTimeout: 5 * time.Second,
+	})
+	must.NoError(err)
+	defer func() {
+		must.NoError(cli.Close())
+	}()
+	waitEtcd(ctx, t, cli)
+
+	wal, err := shrimpd.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
+	must.NoError(err)
+	defer func() {
+		must.NoError(wal.Close())
+	}()
+
+	addr := freeLocalAddr(t)
+	lsm, err := shrimpd.NewLSM("node1", addr, dataDir, wal, shrimpd.NewRegistry(cli, "node1"))
+	must.NoError(err)
+
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	eg, runCtx := errgroup.WithContext(runCtx)
+	eg.Go(func() error { return lsm.Run(runCtx) })
+	eg.Go(func() error { return shrimpd.NewServer(addr, lsm).Run(runCtx) })
+	defer func() {
+		stop()
+		err := eg.Wait()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			require.NoError(t, err)
+		}
+	}()
+
+	baseURL := "http://" + addr
+	waitHTTP(ctx, t, baseURL+"/parts")
+
+	// Ingest some logs
+	postJSON(ctx, t, baseURL+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
+		{Timestamp: 1000, Data: "hello from test"},
+		{Timestamp: 2000, Data: "error: database connection lost"},
+		{Timestamp: 3000, Data: "request handled"},
+	}})
+
+	// Run shrimply with a term query
+	cmd := exec.CommandContext(ctx, binaryPath, "-server", baseURL, "error")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	t.Logf("CLI Output (term=error): stdout=%q, stderr=%q", stdout.String(), stderr.String())
+	must.NoError(err, "stderr: %s", stderr.String())
+	must.Contains(stdout.String(), "error: database connection lost")
+	must.NotContains(stdout.String(), "hello from test")
+
+	// Run shrimply without term (last logs)
+	stdout.Reset()
+	stderr.Reset()
+	cmd = exec.CommandContext(ctx, binaryPath, "-server", baseURL, "-n", "2")
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	t.Logf("CLI Output (no-term limit=2): stdout=%q, stderr=%q", stdout.String(), stderr.String())
+	must.NoError(err, "stderr: %s", stderr.String())
+	must.Contains(stdout.String(), "error: database connection lost")
+	must.Contains(stdout.String(), "request handled")
+	must.NotContains(stdout.String(), "hello from test") // because limit is 2 and we have 3
+}
+
