@@ -107,7 +107,7 @@ func (l *LSM) Run(ctx context.Context) error {
 				}
 			}
 		case <-compactTick.C:
-			if err := l.compact(ctx); err != nil {
+			if err := l.compact(ctx, false); err != nil {
 				slog.ErrorContext(ctx, "compact failed", "error", err)
 			}
 		}
@@ -183,7 +183,7 @@ func (l *LSM) flush(ctx context.Context) error {
 
 // compact merges all L0 parts for this node into a single L1 part.
 // Uses SwapParts for an atomic etcd transition so no reader sees a gap.
-func (l *LSM) compact(ctx context.Context) error {
+func (l *LSM) compact(ctx context.Context, force bool) error {
 	l.mu.RLock()
 	var l0 []PartMeta
 	for _, p := range l.parts {
@@ -193,7 +193,7 @@ func (l *LSM) compact(ctx context.Context) error {
 	}
 	l.mu.RUnlock()
 
-	if len(l0) < compactTrigger {
+	if !force && len(l0) < compactTrigger {
 		return nil
 	}
 

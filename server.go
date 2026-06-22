@@ -26,11 +26,13 @@ func NewServer(addr string, lsm *LSM) *Server {
 	// GET  /query?from=&to= same as /read, kept as a debug-friendly alias
 	// GET  /part/{id}       raw part JSON (served to peer nodes)
 	// GET  /parts           global part list from etcd (debugging)
+	// POST /compact         forces immediate compaction of L0 parts
 	mux.HandleFunc("POST /ingest", s.handleIngest)
 	mux.HandleFunc("GET /read", s.handleQuery)
 	mux.HandleFunc("GET /query", s.handleQuery)
 	mux.HandleFunc("GET /part/{id}", s.handlePart)
 	mux.HandleFunc("GET /parts", s.handleParts)
+	mux.HandleFunc("POST /compact", s.handleCompact)
 
 	s.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
@@ -108,6 +110,14 @@ func (s *Server) handleParts(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(parts); err != nil {
 		slog.WarnContext(r.Context(), "encode parts response", "error", err)
 	}
+}
+
+func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
+	if err := s.lsm.compact(r.Context(), true); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func parseIntParam(s string, def int64) int64 {
