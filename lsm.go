@@ -4,6 +4,7 @@ package shrimpd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,7 +37,7 @@ type LSM struct {
 	flushSig chan struct{} // buffered(1): signal from Write when threshold crossed
 
 	mu    sync.RWMutex
-	parts []PartMeta // this node's parts, kept in sync with etcd
+	parts []PartMeta // all parts replicated locally, kept in sync with etcd log
 }
 
 // NewLSM creates an LSM instance and replays unflushed entries from the WAL.
@@ -89,6 +90,13 @@ func (l *LSM) Run(ctx context.Context) error {
 	defer flushTick.Stop()
 	defer compactTick.Stop()
 
+	// Start background replication loop.
+	go func() {
+		if err := l.replicationLoop(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			slog.ErrorContext(ctx, "replication loop failed", "error", err)
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -118,25 +126,154 @@ func (l *LSM) startup(ctx context.Context) error {
 	if err := l.reg.RegisterNode(ctx, l.addr); err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
-	// Reload this node's parts from etcd in case we restarted.
-	parts, err := l.reg.ListParts(ctx)
+
+	// Scan local parts from the disk metadata files.
+	files, err := filepath.Glob(filepath.Join(l.dataDir, "parts", "*.meta"))
 	if err != nil {
-		return fmt.Errorf("list parts: %w", err)
+		return fmt.Errorf("glob parts: %w", err)
 	}
-	l.mu.Lock()
-	for _, p := range parts {
-		if p.NodeID == l.nodeID {
-			l.parts = append(l.parts, p)
+
+	var localParts []PartMeta
+	for _, file := range files {
+		f, err := os.Open(file)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to open meta file", "file", file, "error", err)
+			continue
 		}
+		var meta PartMeta
+		decodeErr := json.NewDecoder(f).Decode(&meta)
+		f.Close()
+		if decodeErr != nil {
+			slog.WarnContext(ctx, "failed to decode meta file", "file", file, "error", decodeErr)
+			continue
+		}
+		localParts = append(localParts, meta)
 	}
+
+	l.mu.Lock()
+	l.parts = localParts
 	l.mu.Unlock()
-	slog.InfoContext(ctx, "loaded local parts from etcd", "count", len(l.parts))
+
+	slog.InfoContext(ctx, "loaded local parts from disk", "count", len(l.parts))
 	return nil
 }
 
-// flush drains the memtable, writes an immutable part file atomically via
-// temp-file + rename, then commits the PartMeta to etcd. WAL is truncated
-// only after the etcd commit so recovery is always possible.
+// replicationLoop polls etcd for global mutation log entries and applies them.
+func (l *LSM) replicationLoop(ctx context.Context) error {
+	pointer, err := l.reg.GetQueuePointer(ctx)
+	if err != nil {
+		return fmt.Errorf("get queue pointer: %w", err)
+	}
+	slog.InfoContext(ctx, "started replication loop", "pointer", pointer)
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			entries, err := l.reg.GetLogs(ctx, pointer+1)
+			if err != nil {
+				slog.WarnContext(ctx, "failed to get logs from etcd", "error", err)
+				continue
+			}
+
+			for _, entry := range entries {
+				if entry.Index <= pointer {
+					continue
+				}
+
+				if err := l.applyLogEntry(ctx, entry); err != nil {
+					slog.ErrorContext(ctx, "failed to apply log entry", "index", entry.Index, "op", entry.Op, "error", err)
+					break // Retry from the same pointer next time
+				}
+
+				pointer = entry.Index
+				if err := l.reg.SetQueuePointer(ctx, pointer); err != nil {
+					slog.WarnContext(ctx, "failed to save queue pointer", "pointer", pointer, "error", err)
+				}
+			}
+		}
+	}
+}
+
+func (l *LSM) applyLogEntry(ctx context.Context, entry LogEntry) error {
+	if entry.NodeID == l.nodeID {
+		slog.DebugContext(ctx, "skip own log entry", "index", entry.Index, "op", entry.Op)
+		return nil
+	}
+
+	switch entry.Op {
+	case OpPut:
+		slog.InfoContext(ctx, "replicating PUT part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
+		block, err := fetchRemotePart(entry.Part)
+		if err != nil {
+			return fmt.Errorf("fetch remote part: %w", err)
+		}
+
+		path := l.partPath(entry.Part.ID)
+		metaPath := l.partMetaPath(entry.Part.ID)
+
+		if err := writeBlock(path, block); err != nil {
+			return fmt.Errorf("write block: %w", err)
+		}
+		if err := writeMeta(metaPath, entry.Part); err != nil {
+			os.Remove(path)
+			return fmt.Errorf("write meta: %w", err)
+		}
+
+		l.mu.Lock()
+		l.parts = append(l.parts, entry.Part)
+		l.mu.Unlock()
+
+	case OpMerge:
+		slog.InfoContext(ctx, "replicating MERGE part", "index", entry.Index, "part_id", entry.Part.ID, "from", entry.NodeID)
+		block, err := fetchRemotePart(entry.Part)
+		if err != nil {
+			return fmt.Errorf("fetch remote part: %w", err)
+		}
+
+		path := l.partPath(entry.Part.ID)
+		metaPath := l.partMetaPath(entry.Part.ID)
+
+		if err := writeBlock(path, block); err != nil {
+			return fmt.Errorf("write block: %w", err)
+		}
+		if err := writeMeta(metaPath, entry.Part); err != nil {
+			os.Remove(path)
+			return fmt.Errorf("write meta: %w", err)
+		}
+
+		oldSet := make(map[string]bool, len(entry.OldParts))
+		for _, id := range entry.OldParts {
+			oldSet[id] = true
+			if err := os.Remove(l.partPath(id)); err != nil && !os.IsNotExist(err) {
+				slog.WarnContext(ctx, "failed to remove old part file", "id", id, "error", err)
+			}
+			if err := os.Remove(l.partMetaPath(id)); err != nil && !os.IsNotExist(err) {
+				slog.WarnContext(ctx, "failed to remove old meta file", "id", id, "error", err)
+			}
+		}
+
+		l.mu.Lock()
+		next := make([]PartMeta, 0, len(l.parts))
+		for _, p := range l.parts {
+			if !oldSet[p.ID] {
+				next = append(next, p)
+			}
+		}
+		next = append(next, entry.Part)
+		l.parts = next
+		l.mu.Unlock()
+	}
+
+	return nil
+}
+
+// flush drains the memtable, writes an immutable part file atomically,
+// commits metadata, and appends a PUT operation to the etcd log.
 func (l *LSM) flush(ctx context.Context) error {
 	entries := l.mem.Snapshot()
 	if len(entries) == 0 {
@@ -146,8 +283,10 @@ func (l *LSM) flush(ctx context.Context) error {
 
 	id := newPartID(l.nodeID)
 	path := l.partPath(id)
+	metaPath := l.partMetaPath(id)
+
 	slog.DebugContext(ctx, "creating new part", "id", id, "count", len(entries))
-	if err := writeBlock(path, Block{Data: entries}); err != nil {
+	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), Data: entries}); err != nil {
 		l.mem.Write(entries) // restore on failure so next flush retries
 		return fmt.Errorf("write block: %w", err)
 	}
@@ -161,15 +300,21 @@ func (l *LSM) flush(ctx context.Context) error {
 		Count:        len(entries),
 		Addr:         l.addr,
 	}
-	if err := l.reg.PutPart(ctx, meta); err != nil {
-		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-			slog.WarnContext(ctx, "remove uncommitted part failed", "id", id, "error", removeErr)
-		}
+
+	if err := writeMeta(metaPath, meta); err != nil {
+		os.Remove(path)
 		l.mem.Write(entries)
-		return fmt.Errorf("put part: %w", err)
+		return fmt.Errorf("write meta: %w", err)
 	}
 
-	// Safe to truncate WAL: entries are now durable in the part file and etcd.
+	if _, err := l.reg.AppendLog(ctx, OpPut, meta, nil); err != nil {
+		os.Remove(path)
+		os.Remove(metaPath)
+		l.mem.Write(entries)
+		return fmt.Errorf("append log: %w", err)
+	}
+
+	// Safe to truncate WAL: entries are now durable in the part file and etcd log.
 	if err := l.wal.Rotate(); err != nil {
 		slog.WarnContext(ctx, "wal rotate failed", "error", err)
 	}
@@ -183,12 +328,12 @@ func (l *LSM) flush(ctx context.Context) error {
 }
 
 // compact merges all L0 parts for this node into a single L1 part.
-// Uses SwapParts for an atomic etcd transition so no reader sees a gap.
+// Emits a MERGE operation to the etcd log.
 func (l *LSM) compact(ctx context.Context, force bool) error {
 	l.mu.RLock()
 	var l0 []PartMeta
 	for _, p := range l.parts {
-		if p.Level == 0 {
+		if p.Level == 0 && p.NodeID == l.nodeID {
 			l0 = append(l0, p)
 		}
 	}
@@ -220,8 +365,16 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	}
 	sort.Slice(merged, func(i, j int) bool { return merged[i].Timestamp < merged[j].Timestamp })
 
+	oldIDs := make([]string, len(l0))
+	for i, p := range l0 {
+		oldIDs[i] = p.ID
+	}
+
 	id := newPartID(l.nodeID)
-	if err := writeBlock(l.partPath(id), Block{Data: merged}); err != nil {
+	path := l.partPath(id)
+	metaPath := l.partMetaPath(id)
+
+	if err := writeBlock(path, Block{SourceReplica: l.nodeID, CreatedAt: time.Now().UnixNano(), SourceBlocks: oldIDs, Data: merged}); err != nil {
 		return err
 	}
 
@@ -234,20 +387,26 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 		Count:        len(merged),
 		Addr:         l.addr,
 	}
-	oldIDs := make([]string, len(l0))
-	for i, p := range l0 {
-		oldIDs[i] = p.ID
+
+	if err := writeMeta(metaPath, meta); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("write meta: %w", err)
 	}
+
 	slog.DebugContext(ctx, "compacting parts", "old_ids", oldIDs, "new_id", id, "count", len(merged))
-	if err := l.reg.SwapParts(ctx, meta, oldIDs); err != nil {
-		if removeErr := os.Remove(l.partPath(id)); removeErr != nil && !os.IsNotExist(removeErr) {
-			slog.WarnContext(ctx, "remove uncommitted compacted part failed", "id", id, "error", removeErr)
-		}
-		return fmt.Errorf("swap parts: %w", err)
+
+	if _, err := l.reg.AppendLog(ctx, OpMerge, meta, oldIDs); err != nil {
+		os.Remove(path)
+		os.Remove(metaPath)
+		return fmt.Errorf("append log: %w", err)
 	}
+
 	for _, p := range l0 {
 		if err := os.Remove(l.partPath(p.ID)); err != nil && !os.IsNotExist(err) {
 			slog.WarnContext(ctx, "remove old part failed", "id", p.ID, "error", err)
+		}
+		if err := os.Remove(l.partMetaPath(p.ID)); err != nil && !os.IsNotExist(err) {
+			slog.WarnContext(ctx, "remove old meta failed", "id", p.ID, "error", err)
 		}
 	}
 
@@ -270,25 +429,19 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 	return nil
 }
 
-// Query returns all entries in [from, to] across all nodes (via etcd part list),
-// including the local memtable. Remote parts are fetched via HTTP.
+// Query returns all entries in [from, to] across all nodes by reading locally replicated parts.
 func (l *LSM) Query(ctx context.Context, from, to int64) ([]Entry, error) {
-	allParts, err := l.reg.ListParts(ctx)
-	if err != nil {
-		return nil, err
-	}
+	l.mu.RLock()
+	allParts := make([]PartMeta, len(l.parts))
+	copy(allParts, l.parts)
+	l.mu.RUnlock()
 
 	result := make([]Entry, 0)
 	for _, meta := range allParts {
 		if !meta.overlaps(from, to) {
 			continue
 		}
-		var block Block
-		if meta.NodeID == l.nodeID {
-			block, err = l.readLocalPart(meta.ID)
-		} else {
-			block, err = fetchRemotePart(meta)
-		}
+		block, err := l.readLocalPart(meta.ID)
 		if err != nil {
 			slog.WarnContext(ctx, "skip part", "id", meta.ID, "error", err)
 			continue
@@ -311,9 +464,13 @@ func (l *LSM) Query(ctx context.Context, from, to int64) ([]Entry, error) {
 	return result, nil
 }
 
-// AllParts returns the global part list from etcd.
+// AllParts returns the copy of current memory parts list.
 func (l *LSM) AllParts(ctx context.Context) ([]PartMeta, error) {
-	return l.reg.ListParts(ctx)
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	copied := make([]PartMeta, len(l.parts))
+	copy(copied, l.parts)
+	return copied, nil
 }
 
 // ServeLocalPart streams the raw part file to w. Used by /part/{id}.
@@ -332,6 +489,10 @@ func (l *LSM) ServeLocalPart(id string, w io.Writer) error {
 
 func (l *LSM) partPath(id string) string {
 	return filepath.Join(l.dataDir, "parts", id+".json")
+}
+
+func (l *LSM) partMetaPath(id string) string {
+	return filepath.Join(l.dataDir, "parts", id+".meta")
 }
 
 func (l *LSM) readLocalPart(id string) (Block, error) {
@@ -356,21 +517,36 @@ func writeBlock(path string, b Block) error {
 	}
 	name := tmp.Name()
 	if err := json.NewEncoder(tmp).Encode(b); err != nil {
-		if closeErr := tmp.Close(); closeErr != nil {
-			slog.Warn("close temp part after encode failure", "path", name, "error", closeErr)
-		}
-		if removeErr := os.Remove(name); removeErr != nil && !os.IsNotExist(removeErr) {
-			slog.Warn("remove temp part after encode failure", "path", name, "error", removeErr)
-		}
+		tmp.Close()
+		os.Remove(name)
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		if closeErr := tmp.Close(); closeErr != nil {
-			slog.Warn("close temp part after sync failure", "path", name, "error", closeErr)
-		}
-		if removeErr := os.Remove(name); removeErr != nil && !os.IsNotExist(removeErr) {
-			slog.Warn("remove temp part after sync failure", "path", name, "error", removeErr)
-		}
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+// writeMeta writes meta to path atomically via a temp-file + rename.
+func writeMeta(path string, meta PartMeta) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-meta-")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if err := json.NewEncoder(tmp).Encode(meta); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(name)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -385,9 +561,7 @@ func fetchRemotePart(meta PartMeta) (Block, error) {
 		return Block{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		if err := resp.Body.Close(); err != nil {
-			slog.Warn("close remote part response", "id", meta.ID, "error", err)
-		}
+		resp.Body.Close()
 		return Block{}, fmt.Errorf("remote %s: HTTP %d", meta.ID, resp.StatusCode)
 	}
 	var b Block
@@ -397,4 +571,8 @@ func fetchRemotePart(meta PartMeta) (Block, error) {
 		return Block{}, decodeErr
 	}
 	return b, closeErr
+}
+
+func newPartID(nodeID string) string {
+	return fmt.Sprintf("%d-%s", time.Now().UnixNano(), nodeID)
 }

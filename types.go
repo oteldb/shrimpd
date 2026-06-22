@@ -8,7 +8,10 @@ type Entry struct {
 
 // Block is the wire and file format for a collection of entries.
 type Block struct {
-	Data []Entry `json:"data"`
+	SourceReplica string   `json:"source_replica,omitempty"`
+	CreatedAt     int64    `json:"created_at,omitempty"`
+	SourceBlocks  []string `json:"source_blocks,omitempty"`
+	Data          []Entry  `json:"data"`
 }
 
 // PartMeta describes an immutable part stored on disk and registered in etcd.
