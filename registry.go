@@ -23,6 +23,11 @@ const (
 	partsPrefix = "/lsm/parts/"
 	nodePrefix  = "/lsm/nodes/"
 	leaseTTL    = 10 // seconds
+
+	// maxMergeTxnDeletes caps how many OpDelete ops are included in a single etcd
+	// transaction. etcd's default gRPC max message size is 2 MiB; batching keeps
+	// each request well under that limit.
+	maxMergeTxnDeletes = 64
 )
 
 // LogOp represents the mutation operation.
@@ -101,7 +106,7 @@ func (r *Registry) AppendLog(ctx context.Context, op LogOp, part PartMeta, oldPa
 	for range 100 {
 		resp, err := r.cli.Get(ctx, logPrefix+"/", clientv3.WithLastKey()...)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("get current log revision: %w", err)
 		}
 
 		newSeqNum := int64(1)
@@ -131,10 +136,13 @@ func (r *Registry) AppendLog(ctx context.Context, op LogOp, part PartMeta, oldPa
 		}
 
 		newKey := fmt.Sprintf("%s/%016d", logPrefix, newSeqNum)
+		// Tokens are large and available locally via .meta files; strip them from etcd.
+		etcdPart := part
+		etcdPart.Tokens = nil
 		entry := LogEntry{
 			Index:    newSeqNum,
 			Op:       op,
-			Part:     part,
+			Part:     etcdPart,
 			OldParts: oldParts,
 			NodeID:   r.nodeID,
 		}
@@ -147,31 +155,92 @@ func (r *Registry) AppendLog(ctx context.Context, op LogOp, part PartMeta, oldPa
 		reqPrefix := clientv3.OpPut(baseKey, fmt.Sprintf("%016d", newSeqNum))
 		reqNewLog := clientv3.OpPut(newKey, string(b))
 
-		ops := []clientv3.Op{reqPrefix, reqNewLog}
 		partKey := partsPrefix + part.ID
-		pb, err := json.Marshal(part)
+		pb, err := json.Marshal(etcdPart)
 		if err != nil {
 			return 0, err
 		}
-		switch op {
-		case OpPut:
-			ops = append(ops, clientv3.OpPut(partKey, string(pb)))
-		case OpMerge:
-			ops = append(ops, clientv3.OpPut(partKey, string(pb)))
-			for _, old := range oldParts {
+
+		// First transaction: log entry + new part + first batch of deletes.
+		ops := make([]clientv3.Op, 0, 3+min(len(oldParts), maxMergeTxnDeletes))
+		ops = append(ops, reqPrefix, reqNewLog, clientv3.OpPut(partKey, string(pb)))
+		firstBatch := oldParts
+		var remaining []string
+		if op == OpMerge && len(oldParts) > maxMergeTxnDeletes {
+			firstBatch = oldParts[:maxMergeTxnDeletes]
+			remaining = oldParts[maxMergeTxnDeletes:]
+		}
+		if op == OpMerge {
+			for _, old := range firstBatch {
 				ops = append(ops, clientv3.OpDelete(partsPrefix+old))
 			}
 		}
 
 		txnResp, err := r.cli.Txn(ctx).If(cmp).Then(ops...).Commit()
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("commit log transaction: %w", err)
 		}
 		if txnResp.Succeeded {
+			// Delete any remaining old parts that didn't fit in the first transaction.
+			if len(remaining) > 0 {
+				if err := r.deleteOldParts(ctx, remaining); err != nil {
+					return newSeqNum, fmt.Errorf("delete old parts: %w", err)
+				}
+			}
 			return newSeqNum, nil
 		}
 	}
 	return 0, fmt.Errorf("can't create serial log record, high concurrency")
+}
+
+// deleteOldParts removes old part keys from etcd in batches.
+//
+// In a distributed system, partial failure is normal: the node may crash or lose
+// connectivity after the merge log entry and new part key are committed but before
+// all old part keys are deleted. On recovery the node must be able to resume
+// cleanup from a consistent etcd state rather than rely on in-memory bookkeeping
+// that was lost. Re-reading etcd at the start of each batch achieves this: already-
+// deleted keys are silently skipped, so the function is safe to call multiple times
+// and converges to a clean state regardless of where a previous attempt stopped.
+func (r *Registry) deleteOldParts(ctx context.Context, oldIDs []string) error {
+	// Build a set of IDs we need to delete.
+	want := make(map[string]struct{}, len(oldIDs))
+	for _, id := range oldIDs {
+		want[id] = struct{}{}
+	}
+
+	for range 100 {
+		// Re-read which of the old parts are still alive in etcd.
+		resp, err := r.cli.Get(ctx, partsPrefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+		if err != nil {
+			return fmt.Errorf("list parts for cleanup: %w", err)
+		}
+
+		var alive []string
+		for _, kv := range resp.Kvs {
+			id := strings.TrimPrefix(string(kv.Key), partsPrefix)
+			if _, ok := want[id]; ok {
+				alive = append(alive, id)
+			}
+		}
+		if len(alive) == 0 {
+			return nil
+		}
+
+		// Delete in one batch (bounded by maxMergeTxnDeletes).
+		batch := alive
+		if len(batch) > maxMergeTxnDeletes {
+			batch = alive[:maxMergeTxnDeletes]
+		}
+		delOps := make([]clientv3.Op, len(batch))
+		for i, id := range batch {
+			delOps[i] = clientv3.OpDelete(partsPrefix + id)
+		}
+		if _, err := r.cli.Txn(ctx).Then(delOps...).Commit(); err != nil {
+			return fmt.Errorf("delete old parts batch: %w", err)
+		}
+	}
+	return fmt.Errorf("deleteOldParts: too many retries")
 }
 
 // GetLogs retrieves sequential log entries starting from a given index (inclusive).
