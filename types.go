@@ -72,6 +72,7 @@ type BlockHeader struct {
 type RowBlock struct {
 	Timestamps []int64 // sorted, parallel to Data
 	Data       []string
+	Cost       uint32 // precomputed byte-cost for cache sizing
 }
 
 // rowCacheKey is the cache key for RowBlock caching.

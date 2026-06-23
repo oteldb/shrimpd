@@ -71,11 +71,7 @@ func NewLSM(nodeID, addr, dataDir string, wal *WAL, reg *Registry) (*LSM, error)
 
 	rowBlockCache, _ := otter.MustBuilder[rowCacheKey, *RowBlock](256 << 20).
 		Cost(func(_ rowCacheKey, rb *RowBlock) uint32 {
-			n := 0
-			for i := range rb.Timestamps {
-				n += 8 + len(rb.Data[i])
-			}
-			return uint32(n)
+			return rb.Cost
 		}).
 		Build()
 

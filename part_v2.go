@@ -261,9 +261,15 @@ func readRowBlock(pf *PartFileV2, idx int) (*RowBlock, error) {
 		return nil, fmt.Errorf("unmarshal block %d: %w", idx, err)
 	}
 
+	cost := uint32(len(col.TS) * 8)
+	for _, d := range col.D {
+		cost += uint32(len(d))
+	}
+
 	return &RowBlock{
 		Timestamps: col.TS,
 		Data:       col.D,
+		Cost:       cost,
 	}, nil
 }
 
