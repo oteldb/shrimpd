@@ -70,7 +70,7 @@ type BlockHeader struct {
 
 // RowBlock is the decoded content of one block.
 type RowBlock struct {
-	Timestamps []int64  // sorted, parallel to Data
+	Timestamps []int64 // sorted, parallel to Data
 	Data       []string
 }
 

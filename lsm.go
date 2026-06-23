@@ -50,7 +50,7 @@ type LSM struct {
 
 	rowBlockCache otter.Cache[rowCacheKey, *RowBlock] // keyed by (partID, block index)
 	sparseCache   otter.Cache[string, []SparseEntry]  // keyed by partID, for legacy parts
-	partMgr       *PartManager                         // manages open V2 part files
+	partMgr       *PartManager                        // manages open V2 part files
 }
 
 // Close releases resources held by the LSM without flushing. It is intended for
@@ -69,7 +69,7 @@ func NewLSM(nodeID, addr, dataDir string, wal *WAL, reg *Registry) (*LSM, error)
 		return nil, fmt.Errorf("new index engine: %w", err)
 	}
 
-	rowBlockCache, _ := otter.MustBuilder[rowCacheKey, *RowBlock](1<<16).
+	rowBlockCache, _ := otter.MustBuilder[rowCacheKey, *RowBlock](256 << 20).
 		Cost(func(_ rowCacheKey, rb *RowBlock) uint32 {
 			n := 0
 			for i := range rb.Timestamps {
@@ -79,7 +79,7 @@ func NewLSM(nodeID, addr, dataDir string, wal *WAL, reg *Registry) (*LSM, error)
 		}).
 		Build()
 
-	sparseCache, _ := otter.MustBuilder[string, []SparseEntry](1<<12).
+	sparseCache, _ := otter.MustBuilder[string, []SparseEntry](8 << 20).
 		Cost(func(_ string, s []SparseEntry) uint32 {
 			return uint32(len(s) * 12)
 		}).
@@ -782,7 +782,7 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 	}
 
 	var (
-		result = make([]Entry, 0)
+		result    = make([]Entry, 0)
 		getSparse = func(id string) []SparseEntry {
 			if s, ok := l.sparseCache.Get(id); ok {
 				return s
@@ -1064,7 +1064,7 @@ func fetchRemotePart(meta PartMeta) (raw []byte, block Block, err error) {
 	if len(body) >= 4 && string(body[:4]) == magicShrimp {
 		tmpDir, _ := os.MkdirTemp("", "shrimpd-fetch-*")
 		tmpPath := filepath.Join(tmpDir, meta.ID+".json")
-		if err := os.WriteFile(tmpPath, body, 0o644); err != nil {
+		if err := os.WriteFile(tmpPath, body, 0o600); err != nil {
 			_ = os.RemoveAll(tmpDir)
 			return nil, Block{}, fmt.Errorf("write tmp v2: %w", err)
 		}

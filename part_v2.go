@@ -18,7 +18,7 @@ const (
 	magicShrimp = "SHMP"
 	v2Version   = 0x01
 
-	v2HeaderSize  = 16 // 4 + 1 + 3 + 8
+	v2HeaderSize  = 16   // 4 + 1 + 3 + 8
 	v2BlockDirRow = 1096 // per-block directory entry size
 	v2BlockRows   = 512  // default rows per block
 )
@@ -46,10 +46,7 @@ func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
 	}
 	blocks := make([][]Entry, 0, blockCount)
 	for i := 0; i < len(entries); i += v2BlockRows {
-		end := i + v2BlockRows
-		if end > len(entries) {
-			end = len(entries)
-		}
+		end := min(i+v2BlockRows, len(entries))
 		blocks = append(blocks, entries[i:end])
 	}
 
@@ -95,9 +92,9 @@ func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
 			d[i] = e.Data
 		}
 		colJSON, err := json.Marshal(struct {
-			Ts []int64  `json:"ts"`
+			TS []int64  `json:"ts"`
 			D  []string `json:"d"`
-		}{Ts: ts, D: d})
+		}{TS: ts, D: d})
 		if err != nil {
 			_ = tmp.Close()
 			_ = os.Remove(name)
@@ -261,7 +258,7 @@ func readRowBlock(pf *PartFileV2, idx int) (*RowBlock, error) {
 	}
 
 	var col struct {
-		Ts []int64  `json:"ts"`
+		TS []int64  `json:"ts"`
 		D  []string `json:"d"`
 	}
 	if err := json.Unmarshal(decoded, &col); err != nil {
@@ -269,7 +266,7 @@ func readRowBlock(pf *PartFileV2, idx int) (*RowBlock, error) {
 	}
 
 	return &RowBlock{
-		Timestamps: col.Ts,
+		Timestamps: col.TS,
 		Data:       col.D,
 	}, nil
 }

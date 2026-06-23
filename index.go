@@ -211,7 +211,7 @@ func NewIndexEngine(nodeID, dataDir string) (*IndexEngine, error) {
 	if err != nil {
 		return nil, err
 	}
-	idxBlockCache, _ := otter.MustBuilder[string, IndexBlock](1<<16).
+	idxBlockCache, _ := otter.MustBuilder[string, IndexBlock](64 << 20).
 		Cost(func(_ string, b IndexBlock) uint32 {
 			n := 0
 			for _, e := range b.Entries {
