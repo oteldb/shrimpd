@@ -20,7 +20,7 @@ func bloomMightContain(b *[bloomBytes]byte, token string) bool {
 	h := xxh3.HashString128(token)
 	h1, h2 := h.Lo, h.Hi
 	for i := range bloomK {
-		if getBit(b, h1, h2, i) {
+		if !getBit(b, h1, h2, i) {
 			return false
 		}
 	}
