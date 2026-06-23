@@ -144,14 +144,38 @@ const indexFlushThreshold = 1000
 
 // IndexMemTable holds unflushed index entries in memory.
 type IndexMemTable struct {
-	mu      sync.Mutex
-	entries []IndexEntry
+	entries    []IndexEntry
+	tokenIndex map[string]map[string]struct{}
+	mu         sync.Mutex
 }
 
 func (m *IndexMemTable) Write(entries []IndexEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.entries = append(m.entries, entries...)
+	for _, e := range entries {
+		if m.tokenIndex == nil {
+			m.tokenIndex = make(map[string]map[string]struct{})
+		}
+		if _, ok := m.tokenIndex[e.Token]; !ok {
+			m.tokenIndex[e.Token] = make(map[string]struct{})
+		}
+		m.tokenIndex[e.Token][e.DataID] = struct{}{}
+	}
+}
+
+func (m *IndexMemTable) Lookup(tok string, cb func(dataID string)) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	dataIDs, ok := m.tokenIndex[tok]
+	if !ok {
+		return false
+	}
+	for id := range dataIDs {
+		cb(id)
+	}
+	return true
 }
 
 // Len returns the number of entries in the memtable.
@@ -170,7 +194,8 @@ func (m *IndexMemTable) Snapshot() []IndexEntry {
 	}
 	out := make([]IndexEntry, len(m.entries))
 	copy(out, m.entries)
-	m.entries = nil
+	m.entries = m.entries[:0]
+	clear(m.tokenIndex)
 	return out
 }
 
@@ -186,6 +211,18 @@ func (m *IndexMemTable) All() []IndexEntry {
 	return out
 }
 
+// SnapshotView atomically swaps the memtable contents and passes the snapshot to the provided function for processing.
+func (m *IndexMemTable) SnapshotView(f func([]IndexEntry)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.entries) == 0 {
+		return
+	}
+	f(m.entries)
+	m.entries = nil
+	clear(m.tokenIndex)
+}
+
 // IndexEngine is a local-only index table for fast text-token lookup.
 type IndexEngine struct {
 	nodeID   string
@@ -194,8 +231,9 @@ type IndexEngine struct {
 	wal      *IndexWAL
 	flushSig chan struct{}
 	mu       sync.RWMutex
-	parts    []IndexPartMeta
-	covered  map[string]struct{}
+
+	parts   []IndexPartMeta
+	covered map[string]struct{}
 
 	idxBlockCache otter.Cache[string, IndexBlock] // keyed by absolute path
 }
@@ -395,7 +433,11 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	entries := e.mem.Snapshot()
+	var entries []IndexEntry
+	e.mem.SnapshotView(func(snapshot []IndexEntry) {
+		entries = make([]IndexEntry, len(snapshot))
+		copy(entries, snapshot)
+	})
 	if len(entries) == 0 {
 		return nil
 	}
@@ -589,16 +631,12 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []Part
 	}
 
 	var finalMatches map[string]struct{}
-
 	for i, tok := range tokens {
 		matches := make(map[string]struct{})
 
-		memEntries := e.mem.All()
-		for _, entry := range memEntries {
-			if entry.Token == tok {
-				matches[entry.DataID] = struct{}{}
-			}
-		}
+		e.mem.Lookup(tok, func(dataID string) {
+			matches[dataID] = struct{}{}
+		})
 
 		for _, part := range e.parts {
 			if tok < part.MinToken || tok > part.MaxToken {
