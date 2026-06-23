@@ -12,17 +12,20 @@ services:
     ports:
       - "2379:2379"
     healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
+      test: [ "CMD", "etcdctl", "endpoint", "health" ]
       interval: 5s
       timeout: 5s
       retries: 5
   shrimpd-1:
-    build: .
+    build: ..
+    image: tdakkota/shrimpd:latest
     command:
       - -id=shrimpd-1
       - -addr=shrimpd-1:8080
       - -data=/data
       - -etcd=etcd:2379
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
     ports:
       - "8080:8080"
     volumes:
@@ -30,13 +33,21 @@ services:
     depends_on:
       etcd:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
   shrimpd-2:
-    build: .
+    build: ..
+    image: tdakkota/shrimpd:latest
     command:
       - -id=shrimpd-2
       - -addr=shrimpd-2:8080
       - -data=/data
       - -etcd=etcd:2379
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
     ports:
       - "8081:8080"
     volumes:
@@ -44,13 +55,21 @@ services:
     depends_on:
       etcd:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
   shrimpd-3:
-    build: .
+    build: ..
+    image: tdakkota/shrimpd:latest
     command:
       - -id=shrimpd-3
       - -addr=shrimpd-3:8080
       - -data=/data
       - -etcd=etcd:2379
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
     ports:
       - "8082:8080"
     volumes:
@@ -58,3 +77,17 @@ services:
     depends_on:
       etcd:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
+  otelcol:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.154.0
+    command: [ "--config=/etc/otelcol/config.yaml" ]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol/config.yaml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
