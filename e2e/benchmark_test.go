@@ -1,4 +1,4 @@
-package shrimpd_test
+package e2e
 
 import (
 	"context"
@@ -35,7 +35,7 @@ func setupLSM(b *testing.B, endpoint string) *shrimpd.LSM {
 
 	b.Cleanup(func() {
 		_ = wal.Close()
-		_ = lsm.IndexEngineForTest().Close()
+		_ = lsm.Close()
 		_ = cli.Close()
 	})
 
@@ -137,11 +137,9 @@ func BenchmarkQuery(b *testing.B) {
 			corpus := generateCorpus(startTS+int64(batchIdx*batchSize), batchSize)
 			err := lsm.Write(ctx, corpus)
 			require.NoError(b, err)
-			err = lsm.FlushForTest(ctx)
+			err = lsm.Flush(ctx)
 			require.NoError(b, err)
 		}
-		err := lsm.IndexEngineForTest().Flush(ctx)
-		require.NoError(b, err)
 
 		runQueries(b, lsm, startTS, startTS+int64(numBatches*batchSize))
 	})
@@ -155,12 +153,10 @@ func BenchmarkQuery(b *testing.B) {
 			corpus := generateCorpus(startTS+int64(batchIdx*batchSize), batchSize)
 			err := lsm.Write(ctx, corpus)
 			require.NoError(b, err)
-			err = lsm.FlushForTest(ctx)
+			err = lsm.Flush(ctx)
 			require.NoError(b, err)
 		}
-		err := lsm.CompactForTest(ctx, true)
-		require.NoError(b, err)
-		err = lsm.IndexEngineForTest().Flush(ctx)
+		err := lsm.Compact(ctx)
 		require.NoError(b, err)
 
 		runQueries(b, lsm, startTS, startTS+int64(numBatches*batchSize))

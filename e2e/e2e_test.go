@@ -1,4 +1,4 @@
-package shrimpd_test
+package e2e
 
 import (
 	"bytes"
@@ -7,20 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/tdakkota/shrimpd"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"golang.org/x/sync/errgroup"
@@ -261,138 +257,6 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 	})
 }
 
-var (
-	sharedEtcdOnce      sync.Once
-	sharedEtcdContainer testcontainers.Container
-	sharedEtcdEndpoint  string
-)
-
-func TestMain(m *testing.M) {
-	code := m.Run()
-	if sharedEtcdContainer != nil {
-		_ = sharedEtcdContainer.Terminate(context.Background())
-	}
-	os.Exit(code)
-}
-
-func startEtcd(ctx context.Context, t testing.TB) string {
-	t.Helper()
-	sharedEtcdOnce.Do(func() {
-		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Image:        "quay.io/coreos/etcd:v3.5.13",
-				ExposedPorts: []string{"2379/tcp", "2380/tcp"},
-				Cmd: []string{
-					"/usr/local/bin/etcd",
-					"--name", "node1",
-					"--listen-client-urls", "http://0.0.0.0:2379",
-					"--advertise-client-urls", "http://0.0.0.0:2379",
-					"--listen-peer-urls", "http://0.0.0.0:2380",
-					"--initial-advertise-peer-urls", "http://0.0.0.0:2380",
-					"--initial-cluster", "node1=http://0.0.0.0:2380",
-					"--initial-cluster-state", "new",
-				},
-				WaitingFor: wait.ForListeningPort("2379/tcp").WithStartupTimeout(time.Minute),
-			},
-			Started: true,
-		})
-		require.NoError(t, err)
-		sharedEtcdContainer = container
-
-		host, err := container.Host(ctx)
-		require.NoError(t, err)
-		port, err := container.MappedPort(ctx, "2379/tcp")
-		require.NoError(t, err)
-		sharedEtcdEndpoint = net.JoinHostPort(host, port.Port())
-	})
-	clearEtcd(ctx, t, sharedEtcdEndpoint)
-	return sharedEtcdEndpoint
-}
-
-func clearEtcd(ctx context.Context, t testing.TB, endpoint string) {
-	t.Helper()
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{endpoint},
-		DialTimeout: 5 * time.Second,
-	})
-	require.NoError(t, err)
-	defer func() { require.NoError(t, cli.Close()) }()
-	_, err = cli.Delete(ctx, "/lsm/", clientv3.WithPrefix())
-	require.NoError(t, err)
-}
-
-func waitEtcd(ctx context.Context, t testing.TB, cli *clientv3.Client) {
-	t.Helper()
-	for {
-		_, err := cli.Status(ctx, cli.Endpoints()[0])
-		if err == nil {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			require.Failf(t, "wait for etcd", "endpoint %s: %v", cli.Endpoints()[0], ctx.Err())
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
-func freeLocalAddr(t testing.TB) string {
-	t.Helper()
-	must := require.New(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	must.NoError(err)
-	addr := ln.Addr().String()
-	must.NoError(ln.Close())
-	return addr
-}
-
-func waitHTTP(ctx context.Context, t testing.TB, url string) {
-	t.Helper()
-	must := require.New(t)
-	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
-		must.NoError(err)
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return
-			}
-		}
-		select {
-		case <-ctx.Done():
-			require.Failf(t, "wait for http", "url %s: %v", url, ctx.Err())
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
-func postJSON(ctx context.Context, t testing.TB, url string, v any) {
-	t.Helper()
-	must := require.New(t)
-	body, err := json.Marshal(v)
-	must.NoError(err)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	must.NoError(err)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	must.NoError(err)
-	defer resp.Body.Close()
-	must.Equal(http.StatusNoContent, resp.StatusCode, "POST %s: %s", url, resp.Status)
-}
-
-func getJSON(ctx context.Context, t testing.TB, url string, v any) {
-	t.Helper()
-	must := require.New(t)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
-	must.NoError(err)
-	resp, err := http.DefaultClient.Do(req)
-	must.NoError(err)
-	defer resp.Body.Close()
-	must.Equal(http.StatusOK, resp.StatusCode, "GET %s: %s", url, resp.Status)
-	must.NoError(json.NewDecoder(resp.Body).Decode(v), fmt.Sprintf("decode %s", url))
-}
-
 func TestDaemonReplication(t *testing.T) {
 	if testing.Short() {
 		t.Skip("E2E test for short testing")
@@ -458,18 +322,13 @@ func TestDaemonReplication(t *testing.T) {
 	waitHTTP(ctx, t, baseURL1+"/parts")
 	waitHTTP(ctx, t, baseURL2+"/parts")
 
-	// 1. Ingest into node1.
-	// Since we ingest only 2 entries (which is below the flushThreshold of 100),
-	// it will stay in memtable first. To force a flush to a part, we either wait
-	// for the flushInterval (5s) or we ingest 100 entries.
-	// Let's write 100 entries to force an immediate flush and replication event.
 	entries := make([]shrimpd.Entry, 100)
 	for i := range 100 {
 		entries[i] = shrimpd.Entry{Timestamp: int64(i + 1), Data: fmt.Sprintf("val-%d", i)}
 	}
 	postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: entries})
 
-	// 2. Poll read on node2 until replicated
+	// Poll read on node2 until replicated
 	var got shrimpd.Block
 	for {
 		getJSON(ctx, t, baseURL2+"/read?from=1&to=100", &got)
@@ -486,9 +345,7 @@ func TestDaemonReplication(t *testing.T) {
 	must.Equal(int64(1), got.Data[0].Timestamp)
 	must.Equal("val-0", got.Data[0].Data)
 
-	// 3. Trigger compaction on node1.
-	// To trigger compaction, we need at least compactTrigger (4) L0 parts.
-	// Let's ingest 3 more blocks of 100 entries to create 4 parts in total.
+	// Trigger compaction on node1.
 	for b := 1; b < 4; b++ {
 		batchEntries := make([]shrimpd.Entry, 100)
 		for i := range 100 {
@@ -514,7 +371,7 @@ func TestDaemonReplication(t *testing.T) {
 	// Trigger compact on node 1
 	postJSON(ctx, t, baseURL1+"/compact", nil)
 
-	// 4. Poll parts on node2 until compaction replicated (there should be 1 part with level=1)
+	// Poll parts on node2 until compaction replicated (there should be 1 part with level=1)
 	var parts []shrimpd.PartMeta
 	for {
 		getJSON(ctx, t, baseURL2+"/parts", &parts)
@@ -704,12 +561,6 @@ func TestRecoveringNode(t *testing.T) {
 		postJSON(ctx, t, base1+"/ingest", shrimpd.Block{Data: ents})
 	}
 
-	// Stop only node2 (keep node1 running for continued ingest)
-	// We can't easily stop one goroutine group; recreate node2 lifecycle below by canceling a subctx isn't simple.
-	// Simpler: start node2 later in a separate runCtx2. For now, just stop whole and restart node1+node2 together is wrong.
-	// To isolate, we'll use separate run groups.
-
-	// Stop everything first to cleanly separate phases
 	stop()
 	_ = eg.Wait()
 
@@ -771,10 +622,10 @@ func TestShrimplyCLI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Precompile shrimply binary
+	// Precompile shrimply binary; test runs from e2e/ so use ../cmd/shrimply.
 	tmpBinDir := t.TempDir()
 	binaryPath := filepath.Join(tmpBinDir, "shrimply")
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/shrimply")
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "../cmd/shrimply")
 	must.NoError(buildCmd.Run(), "failed to compile shrimply")
 
 	etcdEndpoint := startEtcd(ctx, t)
@@ -907,9 +758,7 @@ func TestDaemonIndexE2E(t *testing.T) {
 		{Timestamp: 100, Data: "uniqueapple logs message"},
 		{Timestamp: 200, Data: "uniquebanana logs message"},
 	}})
-
-	// Wait for a flush or force it (flush threshold is 100, so we can write 100 logs or wait flushInterval=5s)
-	time.Sleep(6 * time.Second) // wait for data flushInterval
+	postJSON(ctx, t, baseURL1+"/flush", nil)
 
 	// Verify data part was created
 	var partsBefore []shrimpd.PartMeta
@@ -964,8 +813,6 @@ func TestDaemonIndexE2E(t *testing.T) {
 	baseURL2 := "http://" + addr2
 
 	// Verify that indexDir now contains index parts and covered.json again (rebuilt on startup).
-	// waitHTTP only confirms the HTTP server is up; lsm.Run's startup reconciliation
-	// may still be in progress, so poll until the index files appear.
 	waitIndexFiles("after restart rebuild")
 
 	// Query still works
@@ -979,18 +826,8 @@ func TestDaemonIndexE2E(t *testing.T) {
 	postJSON(ctx, t, baseURL2+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
 		{Timestamp: 300, Data: "uniquecherry logs message"},
 	}})
-	time.Sleep(6 * time.Second) // wait for data flushInterval
-
-	// Force compaction
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL2+"/compact", http.NoBody)
-	must.NoError(err)
-	resp, err := http.DefaultClient.Do(req)
-	must.NoError(err)
-	must.Equal(http.StatusNoContent, resp.StatusCode)
-	resp.Body.Close()
-
-	// Allow compaction + background index compaction to run (compactInterval=15s, but we trigger it in ticks)
-	time.Sleep(17 * time.Second)
+	postJSON(ctx, t, baseURL2+"/flush", nil)
+	postJSON(ctx, t, baseURL2+"/compact", nil)
 
 	// Query should still work and find cherry
 	var qCherry shrimpd.Block

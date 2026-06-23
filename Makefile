@@ -7,7 +7,7 @@ coverage:
 .PHONY: coverage
 
 test_fast:
-	go test ./...
+	go test -short ./...
 
 tidy:
 	go mod tidy
