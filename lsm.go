@@ -3,6 +3,7 @@ package shrimpd
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -469,7 +470,7 @@ func (l *LSM) flush(ctx context.Context) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Timestamp < entries[j].Timestamp })
+	slices.SortFunc(entries, func(a, b Entry) int { return cmp.Compare(a.Timestamp, b.Timestamp) })
 
 	id := newPartID(l.nodeID)
 	path := l.partPath(id)
@@ -582,7 +583,7 @@ func (l *LSM) compact(ctx context.Context, force bool) error {
 		}
 		return nil
 	}
-	sort.Slice(merged, func(i, j int) bool { return merged[i].Timestamp < merged[j].Timestamp })
+	slices.SortFunc(merged, func(a, b Entry) int { return cmp.Compare(a.Timestamp, b.Timestamp) })
 
 	oldIDs := make([]string, len(l0))
 	for i, p := range l0 {
@@ -674,18 +675,19 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 	l.mu.RUnlock()
 
 	// Step 1: Filter data parts by timestamp range
-	var timeParts []PartMeta
+	timeParts := make([]PartMeta, 0, 4) // preallocate for common case of 1-4 parts
 	for _, meta := range allParts {
 		if meta.overlaps(from, to) {
 			timeParts = append(timeParts, meta)
 		}
 	}
+	normalizedTerm := strings.ToLower(term)
 
 	// Step 2-4: Filter by index or fall back to old behavior
 	useIndexFilter := false
 	var indexedPartIDs map[string]struct{}
-	if term != "" {
-		matches, complete, err := l.idxEngine.Lookup(ctx, term, timeParts)
+	if normalizedTerm != "" {
+		matches, complete, err := l.idxEngine.Lookup(ctx, normalizedTerm, timeParts)
 		if err != nil {
 			slog.WarnContext(ctx, "index lookup failed, falling back to scanning", "error", err)
 		} else if complete {
@@ -694,7 +696,19 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 		}
 	}
 
-	result := make([]Entry, 0)
+	var (
+		result = make([]Entry, 0)
+		// TODO(tdakkota): consider caching sparse indexes in memory for faster queries
+		sidecarCache = make(map[string][]SparseEntry) // cache sparse index for each part
+		getSparse    = func(id string) []SparseEntry {
+			if s, ok := sidecarCache[id]; ok {
+				return s
+			}
+			s, _ := readSidecar(l.sidecarPath(id))
+			sidecarCache[id] = s
+			return s
+		}
+	)
 	for _, meta := range timeParts {
 		if useIndexFilter {
 			if _, matched := indexedPartIDs[meta.ID]; !matched {
@@ -702,7 +716,7 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 			}
 		} else {
 			// Fallback: use legacy PartMeta.Tokens pruning if available
-			if term != "" && !hasToken(meta.Tokens, term) {
+			if normalizedTerm != "" && !hasToken(meta.Tokens, normalizedTerm) {
 				continue
 			}
 		}
@@ -712,7 +726,7 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 			slog.WarnContext(ctx, "skip part", "id", meta.ID, "error", err)
 			continue
 		}
-		sparse, _ := readSidecar(l.sidecarPath(meta.ID))
+		sparse := getSparse(l.sidecarPath(meta.ID))
 		lo, hi := sparseRange(sparse, from, to)
 		if lo < 0 {
 			lo = 0
@@ -721,8 +735,7 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 			hi = len(block.Data)
 		}
 		for _, e := range block.Data[lo:hi] {
-			if e.Timestamp >= from && e.Timestamp <= to &&
-				(term == "" || strings.Contains(strings.ToLower(e.Data), strings.ToLower(term))) {
+			if e.Matches(from, to, normalizedTerm) {
 				result = append(result, e)
 			}
 		}
@@ -730,13 +743,12 @@ func (l *LSM) Query(ctx context.Context, from, to int64, term string) ([]Entry, 
 
 	// Include memtable (not yet flushed to any part).
 	for _, e := range l.mem.All() {
-		if e.Timestamp >= from && e.Timestamp <= to &&
-			(term == "" || strings.Contains(strings.ToLower(e.Data), strings.ToLower(term))) {
+		if e.Matches(from, to, normalizedTerm) {
 			result = append(result, e)
 		}
 	}
 
-	sort.Slice(result, func(i, j int) bool { return result[i].Timestamp < result[j].Timestamp })
+	slices.SortFunc(result, func(a, b Entry) int { return cmp.Compare(a.Timestamp, b.Timestamp) })
 	return result, nil
 }
 

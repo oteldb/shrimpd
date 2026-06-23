@@ -1,9 +1,25 @@
 package shrimpd
 
+import "strings"
+
 // Entry is the fundamental unit of data. Timestamp is used for ordering and pruning.
 type Entry struct {
 	Timestamp int64  `json:"timestamp"`
 	Data      string `json:"data"`
+}
+
+// Matches returns true if the entry matches the given time range and term.
+func (e Entry) Matches(from, to int64, term string) bool {
+	if !(e.Timestamp >= from && e.Timestamp <= to) {
+		return false
+	}
+	if term == "" {
+		return true
+	}
+	if strings.Contains(e.Data, term) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(e.Data), term)
 }
 
 // Block is the wire and file format for a collection of entries.
