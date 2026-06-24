@@ -58,7 +58,7 @@ services:
     expose:
       - "8080"
     ports:
-      - "6061:6060"
+      - "127.0.0.1:6061:6060"
     volumes:
       - ./nodes/node-1:/data
       - ./profiles/node-1:/profiles
@@ -87,7 +87,7 @@ services:
     expose:
       - "8080"
     ports:
-      - "6062:6060"
+      - "127.0.0.1:6062:6060"
     volumes:
       - ./nodes/node-2:/data
       - ./profiles/node-2:/profiles
@@ -116,7 +116,7 @@ services:
     expose:
       - "8080"
     ports:
-      - "6063:6060"
+      - "127.0.0.1:6063:6060"
     volumes:
       - ./nodes/node-3:/data
       - ./profiles/node-3:/profiles
