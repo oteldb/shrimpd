@@ -30,9 +30,17 @@ type LSM struct {
 	addr    string
 	dataDir string
 
-	mem      *MemTable
-	wal      *shrimpwal.WAL
-	reg      *Registry
+	mem *MemTable
+	wal *shrimpwal.WAL
+	reg *Registry
+	// writeMu makes "snapshot the memtable + seal the WAL" atomic with respect to
+	// concurrent Write, so the sealed segment's contents exactly match the snapshot.
+	// Held only across that brief boundary, never across the heavy flush I/O.
+	writeMu sync.Mutex
+	// flushMu serializes whole flushes against each other (the Run loop and the
+	// HTTP-triggered Flush both call flush). Serial flushes are required for the
+	// WAL seal/discard invariant to hold.
+	flushMu  sync.Mutex
 	flushSig chan struct{} // buffered(1): signal from Write when threshold crossed
 
 	mu    sync.RWMutex
