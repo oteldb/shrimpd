@@ -17,8 +17,12 @@
 secret.yml
 secret.yaml
 
+/ch2shrimpd
 /shrimpd
+/shrimpgateway
+/shrimply
 /example/nodes
+/example/profiles
 /rnd
 
 old.txt
