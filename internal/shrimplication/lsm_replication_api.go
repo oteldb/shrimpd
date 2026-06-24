@@ -38,6 +38,16 @@ func (l *LSM) ServeLocalPart(r *http.Request, w http.ResponseWriter) error {
 	}
 	defer func() { _ = f.Close() }()
 
+	if pf, err := shrimpblock.OpenPartV2(f.Name(), shrimptypes.PartMeta{}); err != nil {
+		return err
+	} else if pf != nil {
+		if err := shrimpblock.VerifyPartV2(pf); err != nil {
+			_ = pf.Close()
+			return err
+		}
+		_ = pf.Close()
+	}
+
 	br := bufio.NewReaderSize(f, 512)
 	head, err := br.Peek(4)
 	if err != nil && err != io.EOF {
@@ -77,7 +87,6 @@ func fetchRemotePart(meta shrimptypes.PartMeta, remoteHTTP *http.Client) (raw []
 	if err != nil {
 		return nil, shrimptypes.Block{}, err
 	}
-	req.Header.Set("Accept-Encoding", shrimpblock.CompressionZstd)
 	resp, err := remoteHTTP.Do(req)
 	if err != nil {
 		return nil, shrimptypes.Block{}, err
@@ -93,6 +102,21 @@ func fetchRemotePart(meta shrimptypes.PartMeta, remoteHTTP *http.Client) (raw []
 		return nil, shrimptypes.Block{}, fmt.Errorf("read body: %w", err)
 	}
 	_ = resp.Body.Close()
+
+	// The httpcompression middleware on the server may transparently apply
+	// HTTP-level compression (zstd) that Go's http.Client does not
+	// auto-decompress. Detect and strip it before format detection so the
+	// V2 magic check and JSON decoder see the native part format.
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+		dec, _, decErr := shrimpblock.OpenBlockReader(bytes.NewReader(body))
+		if decErr == nil {
+			decompressed, readErr := io.ReadAll(dec)
+			_ = dec.Close()
+			if readErr == nil {
+				body = decompressed
+			}
+		}
+	}
 
 	// V2 binary format: write raw bytes verbatim so PartManager can open them.
 	if len(body) >= 4 && string(body[:4]) == shrimpblock.MagicShrimp {
