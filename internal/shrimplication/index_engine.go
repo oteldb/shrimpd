@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/maypok86/otter"
+	"github.com/tdakkota/shrimpd/internal/fsyncutil"
 	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"github.com/tdakkota/shrimpd/internal/shrimpwal"
@@ -26,6 +27,7 @@ type IndexEngine struct {
 	dataDir  string
 	mem      *IndexMemTable
 	wal      *shrimpwal.IndexWAL
+	writeMu  sync.Mutex // serializes writes with flush rotation boundaries
 	flushSig chan struct{}
 	mu       sync.RWMutex
 
@@ -170,7 +172,10 @@ func (e *IndexEngine) saveCovered() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return fsyncutil.SyncDir(filepath.Dir(path))
 }
 
 // MarkCovered marks data part IDs as covered by the index and persists the list.
@@ -188,6 +193,9 @@ func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
 	if err := e.wal.Append(entries); err != nil {
 		return fmt.Errorf("index wal append: %w", err)
 	}
@@ -206,6 +214,9 @@ func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 // state where the memtable has been snapshotted but the new part is not yet in
 // e.parts (which would cause false negatives while coverage reports complete).
 func (e *IndexEngine) Flush(ctx context.Context) error {
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

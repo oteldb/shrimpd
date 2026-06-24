@@ -10,6 +10,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/tdakkota/shrimpd/internal/fsyncutil"
 	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 
@@ -153,6 +154,9 @@ func WritePartV2(path string, entries []shrimptypes.Entry) ([]shrimptypes.BlockH
 		return nil, err
 	}
 	if err := os.Rename(name, path); err != nil {
+		return nil, err
+	}
+	if err := fsyncutil.SyncDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
 

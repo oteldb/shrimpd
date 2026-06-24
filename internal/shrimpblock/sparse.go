@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/tdakkota/shrimpd/internal/fsyncutil"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
@@ -70,7 +71,10 @@ func WriteSidecar(path string, idx []shrimptypes.SparseEntry) error {
 		_ = os.Remove(name)
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return fsyncutil.SyncDir(filepath.Dir(path))
 }
 
 // ReadSidecar reads a sparse index from a sidecar JSON file.

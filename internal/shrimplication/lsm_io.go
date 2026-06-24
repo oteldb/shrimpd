@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/tdakkota/shrimpd/internal/fsyncutil"
 	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
@@ -68,5 +69,8 @@ func WriteMeta(path string, meta shrimptypes.PartMeta) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return fsyncutil.SyncDir(filepath.Dir(path))
 }

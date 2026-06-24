@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/go-faster/jx"
+	"github.com/tdakkota/shrimpd/internal/fsyncutil"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
@@ -66,7 +67,10 @@ func WriteIndexMeta(path string, meta shrimptypes.IndexPartMeta) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return fsyncutil.SyncDir(filepath.Dir(path))
 }
 
 // WriteIndexBlock writes an index block to the given path with the specified compression algorithm.
@@ -102,7 +106,10 @@ func WriteIndexBlock(path string, b shrimptypes.IndexBlock, algo string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	return fsyncutil.SyncDir(filepath.Dir(path))
 }
 
 // ReadIndexBlock reads an index block from the given path and returns it.
