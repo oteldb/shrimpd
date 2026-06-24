@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/tdakkota/shrimpd"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
 func TestParseTime(t *testing.T) {
@@ -35,7 +35,7 @@ func TestParseTime(t *testing.T) {
 
 func TestFormatEntry(t *testing.T) {
 	// Test plain text
-	e1 := shrimpd.Entry{
+	e1 := shrimptypes.Entry{
 		Timestamp: 1000000000,
 		Data:      "plain text log",
 	}
@@ -50,7 +50,7 @@ func TestFormatEntry(t *testing.T) {
 		"attributes": {"key": "value"},
 		"trace_id": "12345"
 	}`
-	e2 := shrimpd.Entry{
+	e2 := shrimptypes.Entry{
 		Timestamp: 1719080000000000000,
 		Data:      otlpJSON,
 	}

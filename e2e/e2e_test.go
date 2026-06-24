@@ -16,7 +16,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/tdakkota/shrimpd"
+	"github.com/tdakkota/shrimpd/internal/shrimpapi"
+	"github.com/tdakkota/shrimpd/internal/shrimplication"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/tdakkota/shrimpd/internal/shrimpwal"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"golang.org/x/sync/errgroup"
@@ -45,21 +48,21 @@ func TestDaemonSmoke(t *testing.T) {
 	}()
 	waitEtcd(ctx, t, cli)
 
-	wal, err := shrimpd.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
+	wal, err := shrimpwal.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
 	must.NoError(err)
 	defer func() {
 		must.NoError(wal.Close())
 	}()
 
 	addr := freeLocalAddr(t)
-	lsm, err := shrimpd.NewLSM("node1", addr, dataDir, wal, shrimpd.NewRegistry(cli, "node1"))
+	lsm, err := shrimplication.NewLSM("node1", addr, dataDir, wal, shrimplication.NewRegistry(cli, "node1"))
 	must.NoError(err)
 
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	eg, runCtx := errgroup.WithContext(runCtx)
 	eg.Go(func() error { return lsm.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr, lsm).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr, lsm).Run(runCtx) })
 	defer func() {
 		stop()
 		err := eg.Wait()
@@ -71,14 +74,14 @@ func TestDaemonSmoke(t *testing.T) {
 	baseURL := "http://" + addr
 	waitHTTP(ctx, t, baseURL+"/parts")
 
-	postJSON(ctx, t, baseURL+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
+	postJSON(ctx, t, baseURL+"/ingest", shrimptypes.Block{Data: []shrimptypes.Entry{
 		{Timestamp: 2, Data: "bar"},
 		{Timestamp: 1, Data: "foo"},
 	}})
 
-	var got shrimpd.Block
+	var got shrimptypes.Block
 	getJSON(ctx, t, baseURL+"/read?from=1&to=2", &got)
-	must.Equal([]shrimpd.Entry{
+	must.Equal([]shrimptypes.Entry{
 		{Timestamp: 1, Data: "foo"},
 		{Timestamp: 2, Data: "bar"},
 	}, got.Data)
@@ -107,21 +110,21 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 	}()
 	waitEtcd(ctx, t, cli)
 
-	wal, err := shrimpd.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
+	wal, err := shrimpwal.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
 	must.NoError(err)
 	defer func() {
 		must.NoError(wal.Close())
 	}()
 
 	addr := freeLocalAddr(t)
-	lsm, err := shrimpd.NewLSM("node1", addr, dataDir, wal, shrimpd.NewRegistry(cli, "node1"))
+	lsm, err := shrimplication.NewLSM("node1", addr, dataDir, wal, shrimplication.NewRegistry(cli, "node1"))
 	must.NoError(err)
 
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	eg, runCtx := errgroup.WithContext(runCtx)
 	eg.Go(func() error { return lsm.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr, lsm).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr, lsm).Run(runCtx) })
 	defer func() {
 		stop()
 		err := eg.Wait()
@@ -167,7 +170,7 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		must.Equal(`{"partialSuccess":{}}`, string(respBody))
 
 		// Verify we can read it back
-		var gotOTLP shrimpd.Block
+		var gotOTLP shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/read?from=1719080000000000000&to=1719080000000000000", &gotOTLP)
 		must.Len(gotOTLP.Data, 1)
 		must.Equal(int64(1719080000000000000), gotOTLP.Data[0].Timestamp)
@@ -188,15 +191,15 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		must.Equal("hello from OTLP JSON", entryObj.Body)
 
 		// Simple term queries exercise tokenization + token index pruning.
-		var qHello shrimpd.Block
+		var qHello shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=hello", &qHello)
 		must.Len(qHello.Data, 1)
 
-		var qOTLP shrimpd.Block
+		var qOTLP shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=otlp", &qOTLP)
 		must.Len(qOTLP.Data, 1)
 
-		var qMiss shrimpd.Block
+		var qMiss shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=nonexistent", &qMiss)
 		must.Len(qMiss.Data, 0)
 	})
@@ -227,7 +230,7 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		must.Len(respPBBody, 0) // expect empty body for protobuf response
 
 		// Verify we can read it back
-		var gotOTLPPB shrimpd.Block
+		var gotOTLPPB shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/read?from=1719080000000000001&to=1719080000000000001", &gotOTLPPB)
 		must.Len(gotOTLPPB.Data, 1)
 		must.Equal(int64(1719080000000000001), gotOTLPPB.Data[0].Timestamp)
@@ -247,11 +250,11 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		must.Equal("hello from OTLP Proto", entryObjPB.Body)
 
 		// Term queries on protobuf-ingested record.
-		var qProto shrimpd.Block
+		var qProto shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000001&to=1719080000000000001&term=proto", &qProto)
 		must.Len(qProto.Data, 1)
 
-		var qProtoMiss shrimpd.Block
+		var qProtoMiss shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000001&to=1719080000000000001&term=xyz", &qProtoMiss)
 		must.Len(qProtoMiss.Data, 0)
 	})
@@ -284,30 +287,30 @@ func TestDaemonReplication(t *testing.T) {
 	must.NoError(os.MkdirAll(filepath.Join(dataDir1, "parts"), 0o755))
 	must.NoError(os.MkdirAll(filepath.Join(dataDir2, "parts"), 0o755))
 
-	wal1, err := shrimpd.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
+	wal1, err := shrimpwal.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
 	must.NoError(err)
 	defer wal1.Close()
 
-	wal2, err := shrimpd.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
+	wal2, err := shrimpwal.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
 	must.NoError(err)
 	defer wal2.Close()
 
 	addr1 := freeLocalAddr(t)
 	addr2 := freeLocalAddr(t)
 
-	lsm1, err := shrimpd.NewLSM("node1", addr1, dataDir1, wal1, shrimpd.NewRegistry(cli, "node1"))
+	lsm1, err := shrimplication.NewLSM("node1", addr1, dataDir1, wal1, shrimplication.NewRegistry(cli, "node1"))
 	must.NoError(err)
 
-	lsm2, err := shrimpd.NewLSM("node2", addr2, dataDir2, wal2, shrimpd.NewRegistry(cli, "node2"))
+	lsm2, err := shrimplication.NewLSM("node2", addr2, dataDir2, wal2, shrimplication.NewRegistry(cli, "node2"))
 	must.NoError(err)
 
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	eg, runCtx := errgroup.WithContext(runCtx)
 	eg.Go(func() error { return lsm1.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr1, lsm1).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr1, lsm1).Run(runCtx) })
 	eg.Go(func() error { return lsm2.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr2, lsm2).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr2, lsm2).Run(runCtx) })
 
 	defer func() {
 		stop()
@@ -322,14 +325,14 @@ func TestDaemonReplication(t *testing.T) {
 	waitHTTP(ctx, t, baseURL1+"/parts")
 	waitHTTP(ctx, t, baseURL2+"/parts")
 
-	entries := make([]shrimpd.Entry, 100)
+	entries := make([]shrimptypes.Entry, 100)
 	for i := range 100 {
-		entries[i] = shrimpd.Entry{Timestamp: int64(i + 1), Data: fmt.Sprintf("val-%d", i)}
+		entries[i] = shrimptypes.Entry{Timestamp: int64(i + 1), Data: fmt.Sprintf("val-%d", i)}
 	}
-	postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: entries})
+	postJSON(ctx, t, baseURL1+"/ingest", shrimptypes.Block{Data: entries})
 
 	// Poll read on node2 until replicated
-	var got shrimpd.Block
+	var got shrimptypes.Block
 	for {
 		getJSON(ctx, t, baseURL2+"/read?from=1&to=100", &got)
 		if len(got.Data) == 100 {
@@ -347,12 +350,12 @@ func TestDaemonReplication(t *testing.T) {
 
 	// Trigger compaction on node1.
 	for b := 1; b < 4; b++ {
-		batchEntries := make([]shrimpd.Entry, 100)
+		batchEntries := make([]shrimptypes.Entry, 100)
 		for i := range 100 {
 			ts := int64(b*100 + i + 1)
-			batchEntries[i] = shrimpd.Entry{Timestamp: ts, Data: fmt.Sprintf("val-%d", ts)}
+			batchEntries[i] = shrimptypes.Entry{Timestamp: ts, Data: fmt.Sprintf("val-%d", ts)}
 		}
-		postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: batchEntries})
+		postJSON(ctx, t, baseURL1+"/ingest", shrimptypes.Block{Data: batchEntries})
 	}
 
 	// Wait for Node 2 to replicate all 4 parts
@@ -372,7 +375,7 @@ func TestDaemonReplication(t *testing.T) {
 	postJSON(ctx, t, baseURL1+"/compact", nil)
 
 	// Poll parts on node2 until compaction replicated (there should be 1 part with level=1)
-	var parts []shrimpd.PartMeta
+	var parts []shrimptypes.PartMeta
 	for {
 		getJSON(ctx, t, baseURL2+"/parts", &parts)
 		if len(parts) == 1 && parts[0].Level == 1 {
@@ -407,36 +410,36 @@ func TestNewNodeBootstrap(t *testing.T) {
 	must.NoError(os.MkdirAll(filepath.Join(dataDir1, "parts"), 0o755))
 	must.NoError(os.MkdirAll(filepath.Join(dataDir2, "parts"), 0o755))
 
-	wal1, _ := shrimpd.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
+	wal1, _ := shrimpwal.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
 	defer wal1.Close()
 
 	addr1 := freeLocalAddr(t)
-	lsm1, _ := shrimpd.NewLSM("node1", addr1, dataDir1, wal1, shrimpd.NewRegistry(cli, "node1"))
+	lsm1, _ := shrimplication.NewLSM("node1", addr1, dataDir1, wal1, shrimplication.NewRegistry(cli, "node1"))
 	runCtx, stop := context.WithCancel(ctx)
 	eg, _ := errgroup.WithContext(runCtx)
 	eg.Go(func() error { return lsm1.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr1, lsm1).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr1, lsm1).Run(runCtx) })
 	baseURL1 := "http://" + addr1
 	waitHTTP(ctx, t, baseURL1+"/parts")
 
 	// ingest enough to flush a part
-	entries := make([]shrimpd.Entry, 100)
+	entries := make([]shrimptypes.Entry, 100)
 	for i := range entries {
-		entries[i] = shrimpd.Entry{Timestamp: int64(i + 1), Data: "v"}
+		entries[i] = shrimptypes.Entry{Timestamp: int64(i + 1), Data: "v"}
 	}
-	postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: entries})
+	postJSON(ctx, t, baseURL1+"/ingest", shrimptypes.Block{Data: entries})
 
 	// start node2 (should bootstrap via /lsm/parts/ not replay from 0)
-	wal2, _ := shrimpd.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
+	wal2, _ := shrimpwal.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
 	defer wal2.Close()
 	addr2 := freeLocalAddr(t)
-	lsm2, _ := shrimpd.NewLSM("node2", addr2, dataDir2, wal2, shrimpd.NewRegistry(cli, "node2"))
+	lsm2, _ := shrimplication.NewLSM("node2", addr2, dataDir2, wal2, shrimplication.NewRegistry(cli, "node2"))
 	eg.Go(func() error { return lsm2.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr2, lsm2).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr2, lsm2).Run(runCtx) })
 	baseURL2 := "http://" + addr2
 	waitHTTP(ctx, t, baseURL2+"/parts")
 
-	var got shrimpd.Block
+	var got shrimptypes.Block
 	for {
 		getJSON(ctx, t, baseURL2+"/read?from=1&to=100", &got)
 		if len(got.Data) == 100 {
@@ -470,26 +473,26 @@ func TestLogTruncation(t *testing.T) {
 	tempDir := t.TempDir()
 	dataDir := filepath.Join(tempDir, "node1")
 	must.NoError(os.MkdirAll(filepath.Join(dataDir, "parts"), 0o755))
-	wal, _ := shrimpd.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
+	wal, _ := shrimpwal.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
 	defer wal.Close()
 
 	addr := freeLocalAddr(t)
-	reg := shrimpd.NewRegistry(cli, "node1")
-	lsm, _ := shrimpd.NewLSM("node1", addr, dataDir, wal, reg)
+	reg := shrimplication.NewRegistry(cli, "node1")
+	lsm, _ := shrimplication.NewLSM("node1", addr, dataDir, wal, reg)
 	runCtx, stop := context.WithCancel(ctx)
 	eg, _ := errgroup.WithContext(runCtx)
 	eg.Go(func() error { return lsm.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr, lsm).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr, lsm).Run(runCtx) })
 	base := "http://" + addr
 	waitHTTP(ctx, t, base+"/parts")
 
 	// generate many parts -> long log
 	for b := range 5 {
-		ents := make([]shrimpd.Entry, 100)
+		ents := make([]shrimptypes.Entry, 100)
 		for i := range ents {
-			ents[i] = shrimpd.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
+			ents[i] = shrimptypes.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
 		}
-		postJSON(ctx, t, base+"/ingest", shrimpd.Block{Data: ents})
+		postJSON(ctx, t, base+"/ingest", shrimptypes.Block{Data: ents})
 		time.Sleep(100 * time.Millisecond)
 	}
 	// force compaction to produce merge entries
@@ -527,25 +530,25 @@ func TestRecoveringNode(t *testing.T) {
 	must.NoError(os.MkdirAll(filepath.Join(dataDir1, "parts"), 0o755))
 	must.NoError(os.MkdirAll(filepath.Join(dataDir2, "parts"), 0o755))
 
-	wal1, _ := shrimpd.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
+	wal1, _ := shrimpwal.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
 	defer wal1.Close()
-	wal2, _ := shrimpd.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
+	wal2, _ := shrimpwal.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
 	defer wal2.Close()
 
 	addr1 := freeLocalAddr(t)
 	addr2 := freeLocalAddr(t)
 
-	reg1 := shrimpd.NewRegistry(cli, "node1")
-	reg2 := shrimpd.NewRegistry(cli, "node2")
-	lsm1, _ := shrimpd.NewLSM("node1", addr1, dataDir1, wal1, reg1)
-	lsm2, _ := shrimpd.NewLSM("node2", addr2, dataDir2, wal2, reg2)
+	reg1 := shrimplication.NewRegistry(cli, "node1")
+	reg2 := shrimplication.NewRegistry(cli, "node2")
+	lsm1, _ := shrimplication.NewLSM("node1", addr1, dataDir1, wal1, reg1)
+	lsm2, _ := shrimplication.NewLSM("node2", addr2, dataDir2, wal2, reg2)
 
 	runCtx, stop := context.WithCancel(ctx)
 	eg, _ := errgroup.WithContext(runCtx)
 	eg.Go(func() error { return lsm1.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr1, lsm1).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr1, lsm1).Run(runCtx) })
 	eg.Go(func() error { return lsm2.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr2, lsm2).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr2, lsm2).Run(runCtx) })
 
 	base1 := "http://" + addr1
 	base2 := "http://" + addr2
@@ -554,11 +557,11 @@ func TestRecoveringNode(t *testing.T) {
 
 	// Ingest on node1 to create log entries
 	for b := range 3 {
-		ents := make([]shrimpd.Entry, 100)
+		ents := make([]shrimptypes.Entry, 100)
 		for i := range ents {
-			ents[i] = shrimpd.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
+			ents[i] = shrimptypes.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
 		}
-		postJSON(ctx, t, base1+"/ingest", shrimpd.Block{Data: ents})
+		postJSON(ctx, t, base1+"/ingest", shrimptypes.Block{Data: ents})
 	}
 
 	stop()
@@ -567,20 +570,20 @@ func TestRecoveringNode(t *testing.T) {
 	// Restart node1 alone to continue producing while node2 is down
 	runCtx1b, stop1b := context.WithCancel(ctx)
 	eg1b, _ := errgroup.WithContext(runCtx1b)
-	wal1b, _ := shrimpd.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
+	wal1b, _ := shrimpwal.OpenWAL(filepath.Join(dataDir1, "wal.jsonl"))
 	defer wal1b.Close()
-	lsm1b, _ := shrimpd.NewLSM("node1", addr1, dataDir1, wal1b, reg1)
+	lsm1b, _ := shrimplication.NewLSM("node1", addr1, dataDir1, wal1b, reg1)
 	eg1b.Go(func() error { return lsm1b.Run(runCtx1b) })
-	eg1b.Go(func() error { return shrimpd.NewServer(addr1, lsm1b).Run(runCtx1b) })
+	eg1b.Go(func() error { return shrimpapi.NewServer(addr1, lsm1b).Run(runCtx1b) })
 	waitHTTP(ctx, t, base1+"/parts")
 
 	// Continue ingest + compact on node1 (node2 offline)
 	for b := 3; b < 6; b++ {
-		ents := make([]shrimpd.Entry, 100)
+		ents := make([]shrimptypes.Entry, 100)
 		for i := range ents {
-			ents[i] = shrimpd.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
+			ents[i] = shrimptypes.Entry{Timestamp: int64(b*100 + i + 1), Data: "v"}
 		}
-		postJSON(ctx, t, base1+"/ingest", shrimpd.Block{Data: ents})
+		postJSON(ctx, t, base1+"/ingest", shrimptypes.Block{Data: ents})
 	}
 	postJSON(ctx, t, base1+"/compact", nil)
 	_ = reg1.LogCleanup(ctx)
@@ -588,14 +591,14 @@ func TestRecoveringNode(t *testing.T) {
 	// Start node2 fresh; it should detect gap and bootstrap from parts
 	runCtx2, stop2 := context.WithCancel(ctx)
 	eg2, _ := errgroup.WithContext(runCtx2)
-	wal2b, _ := shrimpd.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
+	wal2b, _ := shrimpwal.OpenWAL(filepath.Join(dataDir2, "wal.jsonl"))
 	defer wal2b.Close()
-	lsm2b, _ := shrimpd.NewLSM("node2", addr2, dataDir2, wal2b, reg2)
+	lsm2b, _ := shrimplication.NewLSM("node2", addr2, dataDir2, wal2b, reg2)
 	eg2.Go(func() error { return lsm2b.Run(runCtx2) })
-	eg2.Go(func() error { return shrimpd.NewServer(addr2, lsm2b).Run(runCtx2) })
+	eg2.Go(func() error { return shrimpapi.NewServer(addr2, lsm2b).Run(runCtx2) })
 	waitHTTP(ctx, t, base2+"/parts")
 
-	var got shrimpd.Block
+	var got shrimptypes.Block
 	for {
 		getJSON(ctx, t, base2+"/read?from=1&to=600", &got)
 		if len(got.Data) >= 300 { // at least some data after bootstrap
@@ -642,21 +645,21 @@ func TestShrimplyCLI(t *testing.T) {
 	}()
 	waitEtcd(ctx, t, cli)
 
-	wal, err := shrimpd.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
+	wal, err := shrimpwal.OpenWAL(filepath.Join(dataDir, "wal.jsonl"))
 	must.NoError(err)
 	defer func() {
 		must.NoError(wal.Close())
 	}()
 
 	addr := freeLocalAddr(t)
-	lsm, err := shrimpd.NewLSM("node1", addr, dataDir, wal, shrimpd.NewRegistry(cli, "node1"))
+	lsm, err := shrimplication.NewLSM("node1", addr, dataDir, wal, shrimplication.NewRegistry(cli, "node1"))
 	must.NoError(err)
 
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	eg, runCtx := errgroup.WithContext(runCtx)
 	eg.Go(func() error { return lsm.Run(runCtx) })
-	eg.Go(func() error { return shrimpd.NewServer(addr, lsm).Run(runCtx) })
+	eg.Go(func() error { return shrimpapi.NewServer(addr, lsm).Run(runCtx) })
 	defer func() {
 		stop()
 		err := eg.Wait()
@@ -669,7 +672,7 @@ func TestShrimplyCLI(t *testing.T) {
 	waitHTTP(ctx, t, baseURL+"/parts")
 
 	// Ingest some logs
-	postJSON(ctx, t, baseURL+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
+	postJSON(ctx, t, baseURL+"/ingest", shrimptypes.Block{Data: []shrimptypes.Entry{
 		{Timestamp: 1000, Data: "hello from test"},
 		{Timestamp: 2000, Data: "error: database connection lost"},
 		{Timestamp: 3000, Data: "request handled"},
@@ -724,18 +727,18 @@ func TestDaemonIndexE2E(t *testing.T) {
 	waitEtcd(ctx, t, cli)
 
 	runDaemon := func(dir string) (string, func()) {
-		wal, err := shrimpd.OpenWAL(filepath.Join(dir, "wal.jsonl"))
+		wal, err := shrimpwal.OpenWAL(filepath.Join(dir, "wal.jsonl"))
 		must.NoError(err)
 
 		addr := freeLocalAddr(t)
-		lsm, err := shrimpd.NewLSM("node1", addr, dir, wal, shrimpd.NewRegistry(cli, "node1"))
+		lsm, err := shrimplication.NewLSM("node1", addr, dir, wal, shrimplication.NewRegistry(cli, "node1"))
 		must.NoError(err)
 
 		runCtx, stop := context.WithCancel(ctx)
 		eg, runCtx := errgroup.WithContext(runCtx)
 		eg.Go(func() error { return lsm.Run(runCtx) })
 
-		srv := shrimpd.NewServer(addr, lsm)
+		srv := shrimpapi.NewServer(addr, lsm)
 		eg.Go(func() error { return srv.Run(runCtx) })
 
 		baseURL := "http://" + addr
@@ -754,14 +757,14 @@ func TestDaemonIndexE2E(t *testing.T) {
 	baseURL1 := "http://" + addr1
 
 	// Ingest 2 blocks with different unique terms
-	postJSON(ctx, t, baseURL1+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
+	postJSON(ctx, t, baseURL1+"/ingest", shrimptypes.Block{Data: []shrimptypes.Entry{
 		{Timestamp: 100, Data: "uniqueapple logs message"},
 		{Timestamp: 200, Data: "uniquebanana logs message"},
 	}})
 	postJSON(ctx, t, baseURL1+"/flush", nil)
 
 	// Verify data part was created
-	var partsBefore []shrimpd.PartMeta
+	var partsBefore []shrimptypes.PartMeta
 	getJSON(ctx, t, baseURL1+"/parts", &partsBefore)
 	// We expect at least 1 part
 	must.NotEmpty(partsBefore)
@@ -797,7 +800,7 @@ func TestDaemonIndexE2E(t *testing.T) {
 	waitIndexFiles("after flush")
 
 	// Query using unique term
-	var qApple shrimpd.Block
+	var qApple shrimptypes.Block
 	getJSON(ctx, t, baseURL1+"/query?from=100&to=200&term=uniqueapple", &qApple)
 	must.Len(qApple.Data, 1)
 	must.Equal("uniqueapple logs message", qApple.Data[0].Data)
@@ -816,21 +819,21 @@ func TestDaemonIndexE2E(t *testing.T) {
 	waitIndexFiles("after restart rebuild")
 
 	// Query still works
-	var qBanana shrimpd.Block
+	var qBanana shrimptypes.Block
 	getJSON(ctx, t, baseURL2+"/query?from=100&to=200&term=uniquebanana", &qBanana)
 	must.Len(qBanana.Data, 1)
 	must.Equal("uniquebanana logs message", qBanana.Data[0].Data)
 
 	// 3. Compaction test
 	// Ingest more logs to create another L0 part
-	postJSON(ctx, t, baseURL2+"/ingest", shrimpd.Block{Data: []shrimpd.Entry{
+	postJSON(ctx, t, baseURL2+"/ingest", shrimptypes.Block{Data: []shrimptypes.Entry{
 		{Timestamp: 300, Data: "uniquecherry logs message"},
 	}})
 	postJSON(ctx, t, baseURL2+"/flush", nil)
 	postJSON(ctx, t, baseURL2+"/compact", nil)
 
 	// Query should still work and find cherry
-	var qCherry shrimpd.Block
+	var qCherry shrimptypes.Block
 	getJSON(ctx, t, baseURL2+"/query?from=100&to=400&term=uniquecherry", &qCherry)
 	must.Len(qCherry.Data, 1)
 	must.Equal("uniquecherry logs message", qCherry.Data[0].Data)

@@ -1,4 +1,4 @@
-package shrimpd
+package shrimpblock
 
 import (
 	"bufio"
@@ -11,14 +11,17 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-const compressionZstd = "zstd"
+const (
+	CompressionZstd = "zstd"
+	CompressionGzip = "gzip"
+)
 
 var algoMagic = []struct {
 	algo  string
 	magic []byte
 }{
-	{compressionZstd, []byte{0x28, 0xb5, 0x2f, 0xfd}},
-	{"gzip", []byte{0x1f, 0x8b}},
+	{CompressionZstd, []byte{0x28, 0xb5, 0x2f, 0xfd}},
+	{CompressionGzip, []byte{0x1f, 0x8b}},
 }
 
 var encoderPool = sync.Pool{
@@ -85,7 +88,8 @@ type nopWriteCloser struct {
 
 func (nopWriteCloser) Close() error { return nil }
 
-func detectAlgo(head []byte) string {
+// DetectAlgo returns the compression algorithm detected from the given header bytes.
+func DetectAlgo(head []byte) string {
 	for _, m := range algoMagic {
 		if len(head) >= len(m.magic) && bytes.Equal(head[:len(m.magic)], m.magic) {
 			return m.algo
@@ -94,12 +98,16 @@ func detectAlgo(head []byte) string {
 	return ""
 }
 
-func newCompressingWriter(w io.Writer, algo string) (io.WriteCloser, error) {
+// NewCompressingWriter returns a WriteCloser that compresses data written to it using the specified algorithm.
+func NewCompressingWriter(w io.Writer, algo string) (io.WriteCloser, error) {
 	switch algo {
-	case compressionZstd:
+	case CompressionZstd:
 		enc := encoderPool.Get().(*zstd.Encoder)
 		enc.Reset(w)
 		return &zstdCompressWriter{enc: enc}, nil
+	case CompressionGzip:
+		gz := gzip.NewWriter(w)
+		return gz, nil
 	case "":
 		return nopWriteCloser{w}, nil
 	default:
@@ -116,26 +124,26 @@ func newZstdDecompressReader(r io.Reader) (io.ReadCloser, error) {
 	return &zstdDecompressReader{dec: dec}, nil
 }
 
-func openBlockReader(r io.Reader) (io.ReadCloser, string, error) {
+// OpenBlockReader opens a block reader from the given reader, detecting the compression algorithm automatically.
+func OpenBlockReader(r io.Reader) (io.ReadCloser, string, error) {
 	br := bufio.NewReaderSize(r, 512)
 	head, err := br.Peek(4)
 	if err != nil && err != io.EOF {
 		return nil, "", fmt.Errorf("peek block header: %w", err)
 	}
-	switch detectAlgo(head) {
-	case compressionZstd:
-		dec := decoderPool.Get().(*zstd.Decoder)
-		if err := dec.Reset(br); err != nil {
-			decoderPool.Put(dec)
-			return nil, "", fmt.Errorf("zstd reset: %w", err)
+	switch algo := DetectAlgo(head); algo {
+	case CompressionZstd:
+		rc, err := newZstdDecompressReader(br)
+		if err != nil {
+			return nil, "", fmt.Errorf("zstd new reader: %w", err)
 		}
-		return &zstdDecompressReader{dec: dec}, compressionZstd, nil
-	case "gzip":
+		return rc, algo, err
+	case CompressionGzip:
 		gz, err := gzip.NewReader(br)
 		if err != nil {
 			return nil, "", fmt.Errorf("gzip new reader: %w", err)
 		}
-		return gz, "gzip", nil
+		return gz, algo, nil
 	default:
 		return io.NopCloser(br), "", nil
 	}

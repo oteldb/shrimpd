@@ -34,14 +34,22 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/tdakkota/shrimpd"
+	"github.com/tdakkota/shrimpd/internal/shrimpapi"
+	"github.com/tdakkota/shrimpd/internal/shrimplication"
+	shrimpwal "github.com/tdakkota/shrimpd/internal/shrimpwal"
 
 	slogmulti "github.com/samber/slog-multi"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -57,8 +65,39 @@ func main() {
 		addr    = flag.String("addr", "localhost:8080", "HTTP listen + advertise address (host:port)")
 		dataDir = flag.String("data", "./data", "directory for parts and WAL")
 		etcdEps = flag.String("etcd", "localhost:2379", "etcd endpoints, comma-separated")
+
+		// Profiling flags
+		pprofAddr          = flag.String("pprof", "", "expose net/http/pprof on this address (e.g. :6060); empty = disabled")
+		cpuProfile         = flag.String("cpuprofile", "", "write CPU profile to file on exit")
+		memProfileDir      = flag.String("memprofile-dir", "", "directory to write heap profiles; empty = disabled")
+		memProfileInterval = flag.Duration("memprofile-interval", 30*time.Second, "how often to poll heap usage for threshold check")
+		memProfileThresh   = flag.Int64("memprofile-threshold", 0, "auto-dump heap profile when HeapInuse exceeds this many bytes (0 = disabled)")
+		memLimit           = flag.Int64("memlimit", 0, "soft memory limit in bytes passed to runtime/debug.SetMemoryLimit (0 = runtime default); also respects GOMEMLIMIT env var")
 	)
 	flag.Parse()
+
+	// Apply soft memory limit before anything allocates.
+	if *memLimit > 0 {
+		prev := debug.SetMemoryLimit(*memLimit)
+		slog.Info("set memory limit", "bytes", *memLimit, "previous", prev)
+	}
+
+	// CPU profiling.
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile) // #nosec G304
+		if err != nil {
+			slog.Error("create cpu profile", "error", err)
+			os.Exit(1)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			slog.Error("start cpu profile", "error", err)
+			os.Exit(1)
+		}
+		defer func() {
+			pprof.StopCPUProfile()
+			_ = f.Close()
+		}()
+	}
 
 	consoleHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	var handler slog.Handler = consoleHandler
@@ -98,7 +137,7 @@ func main() {
 		}
 	}()
 
-	wal, err := shrimpd.OpenWAL(*dataDir + "/wal.jsonl")
+	wal, err := shrimpwal.OpenWAL(*dataDir + "/wal.jsonl")
 	if err != nil {
 		slog.Error("open wal", "error", err)
 		os.Exit(1)
@@ -108,10 +147,9 @@ func main() {
 			slog.Warn("close wal", "error", err)
 		}
 	}()
+	reg := shrimplication.NewRegistry(cli, *nodeID)
 
-	reg := shrimpd.NewRegistry(cli, *nodeID)
-
-	lsm, err := shrimpd.NewLSM(*nodeID, *addr, *dataDir, wal, reg)
+	lsm, err := shrimplication.NewLSM(*nodeID, *addr, *dataDir, wal, reg)
 	if err != nil {
 		slog.Error("create lsm", "error", err)
 		os.Exit(1)
@@ -120,12 +158,92 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// pprof HTTP server (separate from the main API server).
+	if *pprofAddr != "" {
+		go func() {
+			slog.Info("pprof listening", "addr", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil { // #nosec G114
+				slog.Error("pprof server", "error", err)
+			}
+		}()
+	}
+
+	// Background heap monitor: auto-dump when threshold crossed, and on SIGUSR1.
+	if *memProfileDir != "" {
+		if err := os.MkdirAll(*memProfileDir, 0o750); err != nil {
+			slog.Error("create memprofile dir", "error", err)
+			os.Exit(1)
+		}
+		go heapMonitor(ctx, *memProfileDir, *memProfileThresh, *memProfileInterval)
+	}
+
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error { return lsm.Run(ctx) })
-	eg.Go(func() error { return shrimpd.NewServer(*addr, lsm).Run(ctx) })
+	eg.Go(func() error { return shrimpapi.NewServer(*addr, lsm).Run(ctx) })
 
 	if err := eg.Wait(); err != nil && err != context.Canceled {
 		slog.Error("exit", "error", err)
+	}
+}
+
+// heapMonitor polls heap stats and writes a heap profile when HeapInuse exceeds
+// threshold, and on SIGUSR1. Profiles land in dir as heap-<timestamp>.pprof.
+// A zero threshold disables the automatic dump; SIGUSR1 always works.
+func heapMonitor(ctx context.Context, dir string, threshold int64, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// docker kill -s USR1 <container>  →  manual heap dump
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGUSR1)
+	defer signal.Stop(sigCh)
+
+	var lastDump time.Time
+	const minDumpInterval = 30 * time.Second
+
+	dump := func(reason string) {
+		if time.Since(lastDump) < minDumpInterval {
+			return
+		}
+		path := filepath.Join(dir, fmt.Sprintf("heap-%d.pprof", time.Now().UnixNano()))
+		f, err := os.Create(path) // #nosec G304
+		if err != nil {
+			slog.Error("create heap profile", "error", err)
+			return
+		}
+		runtime.GC() // get up-to-date stats
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			slog.Error("write heap profile", "error", err)
+		} else {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			slog.Info("wrote heap profile",
+				"reason", reason,
+				"path", path,
+				"heap_inuse_mb", ms.HeapInuse>>20,
+				"heap_alloc_mb", ms.HeapAlloc>>20,
+			)
+		}
+		_ = f.Close()
+		lastDump = time.Now()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigCh:
+			dump("SIGUSR1")
+		case <-ticker.C:
+			if threshold <= 0 {
+				continue
+			}
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			if int64(ms.HeapInuse) >= threshold {
+				dump(fmt.Sprintf("threshold(%dMiB)", threshold>>20))
+			}
+		}
 	}
 }
 

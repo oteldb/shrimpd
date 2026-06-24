@@ -1,4 +1,4 @@
-package shrimpd
+package shrimpblock
 
 import (
 	"bytes"
@@ -16,8 +16,8 @@ func TestDetectAlgo(t *testing.T) {
 		head []byte
 		want string
 	}{
-		{"zstd magic", []byte{0x28, 0xb5, 0x2f, 0xfd}, compressionZstd},
-		{"zstd magic with trailing", []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01}, compressionZstd},
+		{"zstd magic", []byte{0x28, 0xb5, 0x2f, 0xfd}, CompressionZstd},
+		{"zstd magic with trailing", []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01}, CompressionZstd},
 		{"gzip magic", []byte{0x1f, 0x8b, 0x08, 0x00}, "gzip"},
 		{"gzip magic exact", []byte{0x1f, 0x8b}, "gzip"},
 		{"json object", []byte{'{', '}', 0x00, 0x00}, ""},
@@ -29,14 +29,14 @@ func TestDetectAlgo(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			require.Equal(t, c.want, detectAlgo(c.head))
+			require.Equal(t, c.want, DetectAlgo(c.head))
 		})
 	}
 }
 
 func TestNewCompressingWriterPassthrough(t *testing.T) {
 	var buf bytes.Buffer
-	cw, err := newCompressingWriter(&buf, "")
+	cw, err := NewCompressingWriter(&buf, "")
 	require.NoError(t, err)
 	payload := []byte(`{"hello":"world"}`)
 	_, err = cw.Write(payload)
@@ -46,14 +46,14 @@ func TestNewCompressingWriterPassthrough(t *testing.T) {
 }
 
 func TestNewCompressingWriterUnknownAlgo(t *testing.T) {
-	_, err := newCompressingWriter(&bytes.Buffer{}, "brotli")
+	_, err := NewCompressingWriter(&bytes.Buffer{}, "brotli")
 	require.Error(t, err)
 }
 
 func TestZstdRoundTrip(t *testing.T) {
 	payload := bytes.Repeat([]byte(`{"data":[{"timestamp":1,"data":"hello world"}]}`), 200)
 	var buf bytes.Buffer
-	cw, err := newCompressingWriter(&buf, compressionZstd)
+	cw, err := NewCompressingWriter(&buf, CompressionZstd)
 	require.NoError(t, err)
 	_, err = cw.Write(payload)
 	require.NoError(t, err)
@@ -62,9 +62,9 @@ func TestZstdRoundTrip(t *testing.T) {
 	require.Less(t, buf.Len(), len(payload), "zstd should compress the repetitive payload")
 	require.Equal(t, []byte{0x28, 0xb5, 0x2f, 0xfd}, buf.Bytes()[:4], "zstd frame magic")
 
-	rc, algo, err := openBlockReader(&buf)
+	rc, algo, err := OpenBlockReader(&buf)
 	require.NoError(t, err)
-	require.Equal(t, compressionZstd, algo)
+	require.Equal(t, CompressionZstd, algo)
 	got, err := io.ReadAll(rc)
 	require.NoError(t, err)
 	require.NoError(t, rc.Close())
@@ -73,7 +73,7 @@ func TestZstdRoundTrip(t *testing.T) {
 
 func TestOpenBlockReaderPlainJSON(t *testing.T) {
 	payload := []byte(`{"data":[{"timestamp":1,"data":"foo"}]}`)
-	rc, algo, err := openBlockReader(bytes.NewReader(payload))
+	rc, algo, err := OpenBlockReader(bytes.NewReader(payload))
 	require.NoError(t, err)
 	require.Equal(t, "", algo)
 	got, err := io.ReadAll(rc)
@@ -90,7 +90,7 @@ func TestOpenBlockReaderGzip(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, gz.Close())
 
-	rc, algo, err := openBlockReader(&buf)
+	rc, algo, err := OpenBlockReader(&buf)
 	require.NoError(t, err)
 	require.Equal(t, "gzip", algo)
 	got, err := io.ReadAll(rc)
@@ -105,7 +105,7 @@ func TestEncoderPoolConcurrent(t *testing.T) {
 	for range 8 {
 		wg.Go(func() {
 			var buf bytes.Buffer
-			cw, err := newCompressingWriter(&buf, compressionZstd)
+			cw, err := NewCompressingWriter(&buf, CompressionZstd)
 			if err != nil {
 				t.Error(err)
 				return
@@ -119,7 +119,7 @@ func TestEncoderPoolConcurrent(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			rc, _, err := openBlockReader(&buf)
+			rc, _, err := OpenBlockReader(&buf)
 			if err != nil {
 				t.Error(err)
 				return

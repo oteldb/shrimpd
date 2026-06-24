@@ -1,9 +1,8 @@
-package shrimpd
+package shrimpblock
 
 import (
 	"bufio"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,11 +10,14 @@ import (
 	"slices"
 	"time"
 
+	"github.com/go-faster/jx"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+
 	"github.com/klauspost/compress/zstd"
 )
 
 const (
-	magicShrimp = "SHMP"
+	MagicShrimp = "SHMP"
 	v2Version   = 0x01
 
 	v2HeaderSize  = 16   // 4 + 1 + 3 + 8
@@ -25,15 +27,15 @@ const (
 
 // PartFileV2 holds an open file descriptor and its block directory in memory.
 type PartFileV2 struct {
-	Meta    PartMeta
-	Headers []BlockHeader
+	Meta    shrimptypes.PartMeta
+	Headers []shrimptypes.BlockHeader
 	fd      *os.File
 }
 
-// writePartV2 splits entries into n-row blocks, builds bloom per block,
+// WritePartV2 splits entries into n-row blocks, builds bloom per block,
 // compresses each block independently, and writes the header + directory + data.
 // Returns the written headers.
-func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
+func WritePartV2(path string, entries []shrimptypes.Entry) ([]shrimptypes.BlockHeader, error) {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-v2-")
 	if err != nil {
 		return nil, fmt.Errorf("create temp: %w", err)
@@ -44,17 +46,17 @@ func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
 	if blockCount == 0 {
 		blockCount = 1
 	}
-	blocks := make([][]Entry, 0, blockCount)
+	blocks := make([][]shrimptypes.Entry, 0, blockCount)
 	for i := 0; i < len(entries); i += v2BlockRows {
 		end := min(i+v2BlockRows, len(entries))
 		blocks = append(blocks, entries[i:end])
 	}
 
-	headers := make([]BlockHeader, len(blocks))
+	headers := make([]shrimptypes.BlockHeader, len(blocks))
 
 	// Write magic header placeholder
 	headerBuf := make([]byte, v2HeaderSize)
-	copy(headerBuf[0:4], magicShrimp)
+	copy(headerBuf[0:4], MagicShrimp)
 	headerBuf[4] = v2Version
 	// reserved: bytes 5-7 are zero
 	binary.LittleEndian.PutUint64(headerBuf[8:16], uint64(len(blocks)))
@@ -79,26 +81,35 @@ func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
 	enc := encoderPool.Get().(*zstd.Encoder)
 	defer encoderPool.Put(enc)
 
+	jw := jx.GetWriter()
+	defer jx.PutWriter(jw)
+
 	for bi, block := range blocks {
-		// Build columnar JSON: {"ts":[...],"d":[...]}
-		ts := make([]int64, len(block))
-		d := make([]string, len(block))
+		// Build columnar JSON: {"ts":[...],"d":[...]} using jx.Writer (no reflection).
+		jw.Reset()
+		jw.ObjStart()
+		jw.RawStr(`"ts":`)
+		jw.ArrStart()
 		for i, e := range block {
-			ts[i] = e.Timestamp
-			d[i] = e.Data
+			if i != 0 {
+				jw.Comma()
+			}
+			jw.Int64(e.Timestamp)
 		}
-		colJSON, err := json.Marshal(struct {
-			TS []int64  `json:"ts"`
-			D  []string `json:"d"`
-		}{TS: ts, D: d})
-		if err != nil {
-			_ = tmp.Close()
-			_ = os.Remove(name)
-			return nil, fmt.Errorf("marshal block: %w", err)
+		jw.ArrEnd()
+		jw.RawStr(`,"d":`)
+		jw.ArrStart()
+		for i, e := range block {
+			if i != 0 {
+				jw.Comma()
+			}
+			jw.Str(e.Data)
 		}
+		jw.ArrEnd()
+		jw.ObjEnd()
 
 		enc.Reset(tmp)
-		if _, err := enc.Write(colJSON); err != nil {
+		if _, err := enc.Write(jw.Buf); err != nil {
 			_ = tmp.Close()
 			_ = os.Remove(name)
 			return nil, fmt.Errorf("compress block: %w", err)
@@ -112,14 +123,14 @@ func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
 		compressedSz := compressedEnd - payloadOffset
 
 		// Build bloom filter from block entries
-		var bloom [1024]byte
+		var bloom shrimptypes.BloomFilter
 		for _, e := range block {
-			for tok := range tokenize(e.Data) {
-				bloomAdd(&bloom, tok)
+			for tok := range Tokenize(e.Data) {
+				BloomAdd(&bloom, tok)
 			}
 		}
 
-		headers[bi] = BlockHeader{
+		headers[bi] = shrimptypes.BlockHeader{
 			Offset:       payloadOffset,
 			CompressedSz: compressedSz,
 			Count:        int32(len(block)),
@@ -165,9 +176,9 @@ func writePartV2(path string, entries []Entry) ([]BlockHeader, error) {
 	return headers, nil
 }
 
-// openPartV2 reads the magic, block directory, and returns a PartFileV2.
+// OpenPartV2 reads the magic, block directory, and returns a PartFileV2.
 // If the file does not have the V2 magic, returns nil, nil.
-func openPartV2(path string, meta PartMeta) (*PartFileV2, error) {
+func OpenPartV2(path string, meta shrimptypes.PartMeta) (*PartFileV2, error) {
 	f, err := os.Open(path) // #nosec G304 -- trusted internal part path
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -182,7 +193,7 @@ func openPartV2(path string, meta PartMeta) (*PartFileV2, error) {
 		_ = f.Close()
 		return nil, err
 	}
-	if string(head) != magicShrimp {
+	if string(head) != MagicShrimp {
 		_ = f.Close()
 		return nil, nil // legacy JSON file
 	}
@@ -204,10 +215,10 @@ func openPartV2(path string, meta PartMeta) (*PartFileV2, error) {
 		return nil, fmt.Errorf("read block dir: %w", err)
 	}
 
-	headers := make([]BlockHeader, blockCount)
+	headers := make([]shrimptypes.BlockHeader, blockCount)
 	for bi := range blockCount {
 		row := dirBuf[bi*v2BlockDirRow : (bi+1)*v2BlockDirRow]
-		headers[bi] = BlockHeader{
+		headers[bi] = shrimptypes.BlockHeader{
 			Offset:       int64(binary.LittleEndian.Uint64(row[0:8])),
 			CompressedSz: int64(binary.LittleEndian.Uint64(row[8:16])),
 			Count:        int32(binary.LittleEndian.Uint32(row[16:20])),
@@ -229,9 +240,9 @@ func (pf *PartFileV2) Close() error {
 	return pf.fd.Close()
 }
 
-// readRowBlock pread-fetches exactly hdr.CompressedSz bytes at hdr.Offset,
+// ReadRowBlock pread-fetches exactly hdr.CompressedSz bytes at hdr.Offset,
 // decompresses, decodes columnar JSON into RowBlock.
-func readRowBlock(pf *PartFileV2, idx int) (*RowBlock, error) {
+func ReadRowBlock(pf *PartFileV2, idx int) (*shrimptypes.RowBlock, error) {
 	if idx < 0 || idx >= len(pf.Headers) {
 		return nil, fmt.Errorf("block index %d out of range (0-%d)", idx, len(pf.Headers)-1)
 	}
@@ -253,43 +264,145 @@ func readRowBlock(pf *PartFileV2, idx int) (*RowBlock, error) {
 		return nil, fmt.Errorf("decompress block %d: %w", idx, err)
 	}
 
-	var col struct {
-		TS []int64  `json:"ts"`
-		D  []string `json:"d"`
-	}
-	if err := json.Unmarshal(decoded, &col); err != nil {
-		return nil, fmt.Errorf("unmarshal block %d: %w", idx, err)
+	// Decode columnar JSON {"ts":[...],"d":[...]} without reflection.
+	// decoded is fully in memory after zstd decompress, so DecodeBytes is zero-copy
+	// for string slices where the source lives long enough (we copy via Str()).
+	var (
+		timestamps []int64
+		data       []string
+	)
+	jd := jx.DecodeBytes(decoded)
+	if err := jd.ObjBytes(func(jd *jx.Decoder, key []byte) error {
+		switch string(key) {
+		case "ts":
+			return jd.Arr(func(jd *jx.Decoder) error {
+				v, err := jd.Int64()
+				if err != nil {
+					return err
+				}
+				timestamps = append(timestamps, v)
+				return nil
+			})
+		case "d":
+			return jd.Arr(func(jd *jx.Decoder) error {
+				v, err := jd.Str()
+				if err != nil {
+					return err
+				}
+				data = append(data, v)
+				return nil
+			})
+		default:
+			return jd.Skip()
+		}
+	}); err != nil {
+		return nil, fmt.Errorf("decode block %d: %w", idx, err)
 	}
 
-	cost := uint32(len(col.TS) * 8)
-	for _, d := range col.D {
-		cost += uint32(len(d))
+	cost := uint32(len(timestamps) * 8)
+	for _, s := range data {
+		cost += uint32(len(s))
 	}
 
-	return &RowBlock{
-		Timestamps: col.TS,
-		Data:       col.D,
+	return &shrimptypes.RowBlock{
+		Timestamps: timestamps,
+		Data:       data,
 		Cost:       cost,
 	}, nil
 }
 
-// v2ToBlock converts a V2 part file to a legacy Block for backward-compatible
+// streamRowBlock decompresses block idx and calls fn for each entry that passes
+// the timestamp range and term filter. Unlike readRowBlock, no RowBlock is built
+// and no result slice is accumulated: only one string is allocated per matching
+// entry via string(StrBytes(…)). The decoded buffer is discarded after return.
+//
+// Two-pass decode: pass 1 collects all timestamps (int64, zero string allocs),
+// pass 2 calls StrBytes per data element — a subslice of the decoded buffer for
+// plain strings — and only materializes a Go string for entries that match.
+func StreamRowBlock(pf *PartFileV2, idx int, from, to int64, term string, fn func(shrimptypes.Entry) error) error {
+	if idx < 0 || idx >= len(pf.Headers) {
+		return fmt.Errorf("block index %d out of range (0-%d)", idx, len(pf.Headers)-1)
+	}
+	hdr := pf.Headers[idx]
+
+	compressed := make([]byte, hdr.CompressedSz)
+	if _, err := pf.fd.ReadAt(compressed, hdr.Offset); err != nil {
+		return fmt.Errorf("read block %d: %w", idx, err)
+	}
+
+	dec := decoderPool.Get().(*zstd.Decoder)
+	decoded, err := dec.DecodeAll(compressed, nil)
+	_ = dec.Reset(nil)
+	decoderPool.Put(dec)
+	if err != nil {
+		return fmt.Errorf("decompress block %d: %w", idx, err)
+	}
+
+	// Pass 1: collect timestamps (int64 — no string allocations).
+	var timestamps []int64
+	jd1 := jx.DecodeBytes(decoded)
+	if err := jd1.ObjBytes(func(jd *jx.Decoder, key []byte) error {
+		if string(key) == "ts" {
+			return jd.Arr(func(jd *jx.Decoder) error {
+				v, err := jd.Int64()
+				if err == nil {
+					timestamps = append(timestamps, v)
+				}
+				return err
+			})
+		}
+		return jd.Skip()
+	}); err != nil {
+		return fmt.Errorf("decode ts block %d: %w", idx, err)
+	}
+
+	// Pass 2: decode data strings with StrBytes (subslice of decoded — no alloc for
+	// plain strings). Skip the string entirely for out-of-range timestamps. Only
+	// call string(sb) for entries that actually match.
+	j := 0
+	jd2 := jx.DecodeBytes(decoded)
+	return jd2.ObjBytes(func(jd *jx.Decoder, key []byte) error {
+		if string(key) != "d" {
+			return jd.Skip()
+		}
+		return jd.Arr(func(jd *jx.Decoder) error {
+			if j >= len(timestamps) {
+				return jd.Skip()
+			}
+			ts := timestamps[j]
+			j++
+			if ts < from || ts > to {
+				return jd.Skip()
+			}
+			sb, err := jd.StrBytes()
+			if err != nil {
+				return err
+			}
+			if term != "" && !shrimptypes.FoldContains(sb, term) {
+				return nil
+			}
+			return fn(shrimptypes.Entry{Timestamp: ts, Data: string(sb)})
+		})
+	})
+}
+
+// V2ToBlock converts a V2 part file to a legacy Block for backward-compatible
 // remote serving. It reads and merges all blocks.
-func v2ToBlock(pf *PartFileV2) (Block, error) {
-	var entries []Entry
+func V2ToBlock(pf *PartFileV2) (shrimptypes.Block, error) {
+	var entries []shrimptypes.Entry
 	for i := range pf.Headers {
-		rb, err := readRowBlock(pf, i)
+		rb, err := ReadRowBlock(pf, i)
 		if err != nil {
-			return Block{}, err
+			return shrimptypes.Block{}, err
 		}
 		for j := range rb.Timestamps {
-			entries = append(entries, Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
+			entries = append(entries, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
 		}
 	}
-	slices.SortFunc(entries, func(a, b Entry) int {
+	slices.SortFunc(entries, func(a, b shrimptypes.Entry) int {
 		return int(a.Timestamp - b.Timestamp)
 	})
-	return Block{
+	return shrimptypes.Block{
 		SourceReplica: pf.Meta.NodeID,
 		CreatedAt:     time.Now().UnixNano(),
 		Data:          entries,

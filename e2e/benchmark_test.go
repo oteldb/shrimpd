@@ -11,10 +11,12 @@ import (
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"github.com/tdakkota/shrimpd"
+	"github.com/tdakkota/shrimpd/internal/shrimplication"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/tdakkota/shrimpd/internal/shrimpwal"
 )
 
-func setupLSM(b *testing.B, endpoint string) *shrimpd.LSM {
+func setupLSM(b *testing.B, endpoint string) *shrimplication.LSM {
 	b.Helper()
 	dir := b.TempDir()
 	require.NoError(b, os.MkdirAll(filepath.Join(dir, "parts"), 0o755))
@@ -25,12 +27,12 @@ func setupLSM(b *testing.B, endpoint string) *shrimpd.LSM {
 	})
 	require.NoError(b, err)
 
-	wal, err := shrimpd.OpenWAL(filepath.Join(dir, "wal.jsonl"))
+	wal, err := shrimpwal.OpenWAL(filepath.Join(dir, "wal.jsonl"))
 	require.NoError(b, err)
 
 	addr := freeLocalAddr(b)
 
-	lsm, err := shrimpd.NewLSM("bench-node", addr, dir, wal, shrimpd.NewRegistry(cli, "bench-node"))
+	lsm, err := shrimplication.NewLSM("bench-node", addr, dir, wal, shrimplication.NewRegistry(cli, "bench-node"))
 	require.NoError(b, err)
 
 	b.Cleanup(func() {
@@ -42,8 +44,8 @@ func setupLSM(b *testing.B, endpoint string) *shrimpd.LSM {
 	return lsm
 }
 
-func generateCorpus(startTS int64, count int) []shrimpd.Entry {
-	entries := make([]shrimpd.Entry, count)
+func generateCorpus(startTS int64, count int) []shrimptypes.Entry {
+	entries := make([]shrimptypes.Entry, count)
 	for i := range count {
 		level := "INFO"
 		var suffix string
@@ -56,7 +58,7 @@ func generateCorpus(startTS int64, count int) []shrimpd.Entry {
 			}
 			suffix = fmt.Sprintf(" - randomtoken-%d", i)
 		}
-		entries[i] = shrimpd.Entry{
+		entries[i] = shrimptypes.Entry{
 			Timestamp: startTS + int64(i),
 			Data:      fmt.Sprintf("%s: standard operation status update %d%s", level, i, suffix),
 		}
@@ -64,7 +66,7 @@ func generateCorpus(startTS int64, count int) []shrimpd.Entry {
 	return entries
 }
 
-func runQueries(b *testing.B, lsm *shrimpd.LSM, from, to int64) {
+func runQueries(b *testing.B, lsm *shrimplication.LSM, from, to int64) {
 	b.Helper()
 	ctx := context.Background()
 

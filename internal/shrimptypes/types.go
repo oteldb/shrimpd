@@ -1,6 +1,5 @@
-package shrimpd
-
-import "strings"
+// Package shrimptypes defines the core data structures and types used in the shrimpd project.
+package shrimptypes
 
 // Entry is the fundamental unit of data. Timestamp is used for ordering and pruning.
 type Entry struct {
@@ -9,6 +8,7 @@ type Entry struct {
 }
 
 // Matches returns true if the entry matches the given time range and term.
+// term must already be lowercased by the caller.
 func (e Entry) Matches(from, to int64, term string) bool {
 	if !(e.Timestamp >= from && e.Timestamp <= to) {
 		return false
@@ -16,10 +16,34 @@ func (e Entry) Matches(from, to int64, term string) bool {
 	if term == "" {
 		return true
 	}
-	if strings.Contains(e.Data, term) {
+	return FoldContains(e.Data, term)
+}
+
+// FoldContains reports whether s contains the ASCII-lowercased term anywhere,
+// comparing case-insensitively without allocating. term must be pre-lowercased.
+// Non-ASCII uppercase characters are not folded (acceptable for typical log data).
+func FoldContains[Data, Term ~string | ~[]byte](s Data, term Term) bool {
+	n := len(term)
+	if n == 0 {
 		return true
 	}
-	return strings.Contains(strings.ToLower(e.Data), term)
+	if len(s) < n {
+		return false
+	}
+outer:
+	for i := range len(s) - n + 1 {
+		for j := range n {
+			c := s[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != term[j] {
+				continue outer
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // Block is the wire and file format for a collection of entries.
@@ -54,7 +78,8 @@ type PartMeta struct {
 	BlockCount    int `json:"blocks,omitempty"`
 }
 
-func (m PartMeta) overlaps(from, to int64) bool {
+// Overlaps return true if this part overlaps given time range.
+func (m PartMeta) Overlaps(from, to int64) bool {
 	return m.MaxTimestamp >= from && m.MinTimestamp <= to
 }
 
@@ -65,8 +90,21 @@ type BlockHeader struct {
 	Count        int32 // number of rows in this block
 	MinTimestamp int64
 	MaxTimestamp int64
-	Bloom        [1024]byte // 8192-bit blocked bloom filter, k=4
+	Bloom        BloomFilter // 8192-bit blocked bloom filter, k=4
 }
+
+const (
+	// BloomBits is the number of bits in the bloom filter.
+	BloomBits = 8192
+	// BloomBytes is the number of bytes in the bloom filter.
+	BloomBytes = BloomBits / 8
+	// BloomK is the number of hash functions used in the bloom filter.
+	BloomK = 4
+)
+
+// BloomFilter is a fixed-size 8192-bit blocked bloom filter, k=4.
+// It is used to quickly check whether a token might be present in a block of data.
+type BloomFilter [BloomBytes]byte
 
 // RowBlock is the decoded content of one block.
 type RowBlock struct {
@@ -75,8 +113,8 @@ type RowBlock struct {
 	Cost       uint32 // precomputed byte-cost for cache sizing
 }
 
-// rowCacheKey is the cache key for RowBlock caching.
-type rowCacheKey struct {
+// RowCacheKey is the cache key for RowBlock caching.
+type RowCacheKey struct {
 	PartID string
 	Block  int
 }

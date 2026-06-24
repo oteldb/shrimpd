@@ -1,4 +1,4 @@
-package shrimpd
+package shrimplication
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -42,11 +43,11 @@ const (
 
 // LogEntry describes an operation appended to the global event log.
 type LogEntry struct {
-	Index    int64    `json:"index"`
-	Op       LogOp    `json:"op"`
-	Part     PartMeta `json:"part"`
-	OldParts []string `json:"old_parts,omitempty"`
-	NodeID   string   `json:"node_id"`
+	Index    int64                `json:"index"`
+	Op       LogOp                `json:"op"`
+	Part     shrimptypes.PartMeta `json:"part"`
+	OldParts []string             `json:"old_parts,omitempty"`
+	NodeID   string               `json:"node_id"`
 }
 
 // Registry stores node and part metadata in etcd.
@@ -101,7 +102,7 @@ func (r *Registry) RegisterNode(ctx context.Context, addr string) error {
 
 // AppendLog appends a new mutation operation to the global log.
 // Uses an optimistic transaction loop to determine the next sequential key.
-func (r *Registry) AppendLog(ctx context.Context, op LogOp, part PartMeta, oldParts []string) (int64, error) {
+func (r *Registry) AppendLog(ctx context.Context, op LogOp, part shrimptypes.PartMeta, oldParts []string) (int64, error) {
 	baseKey := "__" + logPrefix
 	for range 100 {
 		resp, err := r.cli.Get(ctx, logPrefix+"/", clientv3.WithLastKey()...)
@@ -264,14 +265,14 @@ func (r *Registry) GetLogs(ctx context.Context, fromIndex int64) ([]LogEntry, er
 }
 
 // GetActiveParts returns the current active parts materialized in etcd under /lsm/parts/.
-func (r *Registry) GetActiveParts(ctx context.Context) (map[string]PartMeta, error) {
+func (r *Registry) GetActiveParts(ctx context.Context) (map[string]shrimptypes.PartMeta, error) {
 	resp, err := r.cli.Get(ctx, partsPrefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
-	active := make(map[string]PartMeta, len(resp.Kvs))
+	active := make(map[string]shrimptypes.PartMeta, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
-		var p PartMeta
+		var p shrimptypes.PartMeta
 		if err := json.Unmarshal(kv.Value, &p); err == nil {
 			active[p.ID] = p
 		}
@@ -282,7 +283,7 @@ func (r *Registry) GetActiveParts(ctx context.Context) (map[string]PartMeta, err
 // BootstrapSnapshot holds a consistent snapshot of the log tail and active parts.
 type BootstrapSnapshot struct {
 	LogIndex int64
-	Parts    map[string]PartMeta
+	Parts    map[string]shrimptypes.PartMeta
 	Revision int64
 }
 
@@ -304,9 +305,9 @@ func (r *Registry) GetBootstrapSnapshot(ctx context.Context) (BootstrapSnapshot,
 	if err != nil {
 		return snap, err
 	}
-	snap.Parts = make(map[string]PartMeta, len(respParts.Kvs))
+	snap.Parts = make(map[string]shrimptypes.PartMeta, len(respParts.Kvs))
 	for _, kv := range respParts.Kvs {
-		var p PartMeta
+		var p shrimptypes.PartMeta
 		if err := json.Unmarshal(kv.Value, &p); err == nil {
 			snap.Parts[p.ID] = p
 		}

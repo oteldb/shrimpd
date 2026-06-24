@@ -1,241 +1,38 @@
-package shrimpd
+package shrimplication
 
 import (
 	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
-	"iter"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/maypok86/otter"
+	"github.com/tdakkota/shrimpd/internal/shrimpblock"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
+	"github.com/tdakkota/shrimpd/internal/shrimpwal"
 )
 
-func tokenize(s string) iter.Seq[string] {
-	return func(yield func(tok string) bool) {
-		token := func(tok string) bool {
-			tok = strings.ToLower(tok)
-			return yield(tok)
-		}
-		seq := strings.FieldsFuncSeq(s, func(r rune) bool {
-			return !unicode.IsLetter(r) && !unicode.IsNumber(r)
-		})
-		for tok := range seq {
-			if !token(tok) {
-				return
-			}
-		}
-	}
-}
-
-func buildTokenSet(entries []Entry) []string {
-	var (
-		seen = make(map[string]struct{})
-		out  []string
-	)
-	for _, e := range entries {
-		for tok := range tokenize(e.Data) {
-			if _, ok := seen[tok]; !ok {
-				seen[tok] = struct{}{}
-				out = append(out, tok)
-			}
-		}
-	}
-	slices.Sort(out) // deterministic
-	return out
-}
-
-func buildSparse(entries []Entry, every int) []SparseEntry {
-	var out []SparseEntry
-	for i := 0; i < len(entries); i += every {
-		out = append(out, SparseEntry{Timestamp: entries[i].Timestamp, Idx: i})
-	}
-	return out
-}
-
-func writeSidecar(path string, idx []SparseEntry) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-sparse-")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	if err := json.NewEncoder(tmp).Encode(idx); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(name)
-		return err
-	}
-	return os.Rename(name, path)
-}
-
-func readSidecar(path string) ([]SparseEntry, error) {
-	f, err := os.Open(path) // #nosec G304 -- trusted internal sidecar path
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-	var idx []SparseEntry
-	if err := json.NewDecoder(f).Decode(&idx); err != nil {
-		return nil, err
-	}
-	return idx, nil
-}
-
-func hasToken(tokens []string, term string) bool {
-	if term == "" || len(tokens) == 0 {
-		return true // empty term or no Tokens (legacy part or remote not reindexed locally): cannot prune
-	}
-	// tokens are sorted; require every sub-token from term to be present (case-insensitive)
-	for tok := range tokenize(term) {
-		if _, found := slices.BinarySearch(tokens, tok); !found {
-			return false
-		}
-	}
-	return true
-}
-
-func sparseRange(sparse []SparseEntry, from, to int64) (lo, hi int) {
-	const hiNotFound = 1<<31 - 1
-	if len(sparse) == 0 {
-		return 0, hiNotFound
-	}
-
-	// find first index where Ts >= from
-	loIdx, _ := slices.BinarySearchFunc(sparse, from, func(e SparseEntry, target int64) int {
-		return cmp.Compare(e.Timestamp, target)
-	})
-	if loIdx > 0 {
-		loIdx-- // include previous sample
-	}
-	lo = sparse[loIdx].Idx
-
-	// find first index where Ts > to
-	// Search for to+1 with a standard three-way comparator so BinarySearchFunc
-	// converges correctly (handles equality and produces exact insertion point).
-	hiIdx, _ := slices.BinarySearchFunc(sparse, to+1, func(e SparseEntry, target int64) int {
-		return cmp.Compare(e.Timestamp, target)
-	})
-	if hiIdx < len(sparse) {
-		hi = sparse[hiIdx].Idx
-	} else {
-		hi = hiNotFound // will be clamped later
-	}
-	return lo, hi
-}
-
 const indexFlushThreshold = 1000
-
-// IndexMemTable holds unflushed index entries in memory.
-type IndexMemTable struct {
-	entries    []IndexEntry
-	tokenIndex map[string]map[string]struct{}
-	mu         sync.Mutex
-}
-
-func (m *IndexMemTable) Write(entries []IndexEntry) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.entries = append(m.entries, entries...)
-	for _, e := range entries {
-		if m.tokenIndex == nil {
-			m.tokenIndex = make(map[string]map[string]struct{})
-		}
-		if _, ok := m.tokenIndex[e.Token]; !ok {
-			m.tokenIndex[e.Token] = make(map[string]struct{})
-		}
-		m.tokenIndex[e.Token][e.DataID] = struct{}{}
-	}
-}
-
-func (m *IndexMemTable) Lookup(tok string, cb func(dataID string)) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	dataIDs, ok := m.tokenIndex[tok]
-	if !ok {
-		return false
-	}
-	for id := range dataIDs {
-		cb(id)
-	}
-	return true
-}
-
-// Len returns the number of entries in the memtable.
-func (m *IndexMemTable) Len() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.entries)
-}
-
-// Snapshot atomically swaps the memtable contents and returns the snapshot.
-func (m *IndexMemTable) Snapshot() []IndexEntry {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.entries) == 0 {
-		return nil
-	}
-	out := make([]IndexEntry, len(m.entries))
-	copy(out, m.entries)
-	m.entries = m.entries[:0]
-	clear(m.tokenIndex)
-	return out
-}
-
-// All returns a copy of all entries in the memtable.
-func (m *IndexMemTable) All() []IndexEntry {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.entries) == 0 {
-		return nil
-	}
-	out := make([]IndexEntry, len(m.entries))
-	copy(out, m.entries)
-	return out
-}
-
-// SnapshotView atomically swaps the memtable contents and passes the snapshot to the provided function for processing.
-func (m *IndexMemTable) SnapshotView(f func([]IndexEntry)) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.entries) == 0 {
-		return
-	}
-	f(m.entries)
-	m.entries = nil
-	clear(m.tokenIndex)
-}
 
 // IndexEngine is a local-only index table for fast text-token lookup.
 type IndexEngine struct {
 	nodeID   string
 	dataDir  string
 	mem      *IndexMemTable
-	wal      *IndexWAL
+	wal      *shrimpwal.IndexWAL
 	flushSig chan struct{}
 	mu       sync.RWMutex
 
-	parts   []IndexPartMeta
+	parts   []shrimptypes.IndexPartMeta
 	covered map[string]struct{}
 
-	idxBlockCache otter.Cache[string, IndexBlock] // keyed by absolute path
+	idxBlockCache otter.Cache[string, shrimptypes.IndexBlock] // keyed by absolute path
 }
 
 // NewIndexEngine initializes the IndexEngine, recovers WAL, and loads metadata.
@@ -245,12 +42,12 @@ func NewIndexEngine(nodeID, dataDir string) (*IndexEngine, error) {
 		return nil, err
 	}
 	walPath := filepath.Join(dataDir, "index-wal.jsonl")
-	wal, err := OpenIndexWAL(walPath)
+	wal, err := shrimpwal.OpenIndexWAL(walPath)
 	if err != nil {
 		return nil, err
 	}
-	idxBlockCache, _ := otter.MustBuilder[string, IndexBlock](64 << 20).
-		Cost(func(_ string, b IndexBlock) uint32 {
+	idxBlockCache, _ := otter.MustBuilder[string, shrimptypes.IndexBlock](64 << 20).
+		Cost(func(_ string, b shrimptypes.IndexBlock) uint32 {
 			n := 0
 			for _, e := range b.Entries {
 				n += len(e.Token) + len(e.DataID)
@@ -303,14 +100,14 @@ func (e *IndexEngine) loadParts() error {
 		return err
 	}
 
-	var parts []IndexPartMeta
+	var parts []shrimptypes.IndexPartMeta
 	for _, f := range files {
 		if f.IsDir() {
 			continue
 		}
 		if filepath.Ext(f.Name()) == ".meta" {
 			metaPath := filepath.Join(indexDir, f.Name())
-			meta, err := readIndexMeta(metaPath)
+			meta, err := shrimpblock.ReadIndexMeta(metaPath)
 			if err != nil {
 				slog.Warn("failed to read index part meta", "path", metaPath, "error", err)
 				continue
@@ -319,7 +116,7 @@ func (e *IndexEngine) loadParts() error {
 		}
 	}
 
-	slices.SortFunc(parts, func(a, b IndexPartMeta) int {
+	slices.SortFunc(parts, func(a, b shrimptypes.IndexPartMeta) int {
 		return cmp.Compare(a.ID, b.ID)
 	})
 
@@ -386,29 +183,8 @@ func (e *IndexEngine) MarkCovered(dataIDs []string) error {
 	return e.saveCovered()
 }
 
-// BuildIndexEntries tokenizes entries and returns sorted, deduplicated IndexEntry values.
-func BuildIndexEntries(dataID string, entries []Entry) []IndexEntry {
-	seen := make(map[string]struct{})
-	var out []IndexEntry
-	for _, e := range entries {
-		for tok := range tokenize(e.Data) {
-			if _, ok := seen[tok]; !ok {
-				seen[tok] = struct{}{}
-				out = append(out, IndexEntry{Token: tok, DataID: dataID})
-			}
-		}
-	}
-	slices.SortFunc(out, func(a, b IndexEntry) int {
-		if c := cmp.Compare(a.Token, b.Token); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.DataID, b.DataID)
-	})
-	return out
-}
-
 // Write appends entries to the index WAL and writes to memtable.
-func (e *IndexEngine) Write(entries []IndexEntry) error {
+func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -433,22 +209,22 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	var entries []IndexEntry
-	e.mem.SnapshotView(func(snapshot []IndexEntry) {
-		entries = make([]IndexEntry, len(snapshot))
+	var entries []shrimptypes.IndexEntry
+	e.mem.SnapshotView(func(snapshot []shrimptypes.IndexEntry) {
+		entries = make([]shrimptypes.IndexEntry, len(snapshot))
 		copy(entries, snapshot)
 	})
 	if len(entries) == 0 {
 		return nil
 	}
 
-	slices.SortFunc(entries, func(a, b IndexEntry) int {
+	slices.SortFunc(entries, func(a, b shrimptypes.IndexEntry) int {
 		if c := cmp.Compare(a.Token, b.Token); c != 0 {
 			return c
 		}
 		return cmp.Compare(a.DataID, b.DataID)
 	})
-	entries = slices.CompactFunc(entries, func(a, b IndexEntry) bool {
+	entries = slices.CompactFunc(entries, func(a, b shrimptypes.IndexEntry) bool {
 		return a.Token == b.Token && a.DataID == b.DataID
 	})
 
@@ -460,13 +236,14 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	indexDir := filepath.Join(e.dataDir, "index")
 	path := filepath.Join(indexDir, id+".json")
 	metaPath := filepath.Join(indexDir, id+".meta")
+	compression := shrimpblock.CompressionZstd
 
-	if err := writeIndexBlock(path, IndexBlock{Entries: entries}, compressionZstd); err != nil {
+	if err := shrimpblock.WriteIndexBlock(path, shrimptypes.IndexBlock{Entries: entries}, compression); err != nil {
 		e.mem.Write(entries) // restore on failure
 		return fmt.Errorf("write index block: %w", err)
 	}
 
-	meta := IndexPartMeta{
+	meta := shrimptypes.IndexPartMeta{
 		ID:          id,
 		NodeID:      e.nodeID,
 		Level:       0,
@@ -474,10 +251,10 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 		MaxToken:    entries[len(entries)-1].Token,
 		Count:       len(entries),
 		CreatedAt:   time.Now().UnixNano(),
-		Compression: compressionZstd,
+		Compression: compression,
 	}
 
-	if err := writeIndexMeta(metaPath, meta); err != nil {
+	if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
 		_ = os.Remove(path)
 		e.mem.Write(entries)
 		return fmt.Errorf("write index meta: %w", err)
@@ -496,7 +273,7 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 // Compact merges L0 index parts into a higher-level part and drops stale DataIDs.
 func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]struct{}) error {
 	e.mu.Lock()
-	var l0 []IndexPartMeta
+	var l0 []shrimptypes.IndexPartMeta
 	for _, p := range e.parts {
 		if p.Level == 0 {
 			l0 = append(l0, p)
@@ -508,30 +285,30 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		return nil
 	}
 
-	var merged []IndexEntry
+	var merged []shrimptypes.IndexEntry
 	for _, meta := range l0 {
 		blockPath := filepath.Join(e.dataDir, "index", meta.ID+".json")
-		block, err := readIndexBlock(blockPath)
+		block, err := shrimpblock.ReadIndexBlock(blockPath)
 		if err != nil {
 			return fmt.Errorf("read index part %s: %w", meta.ID, err)
 		}
 		merged = append(merged, block.Entries...)
 	}
 
-	var active []IndexEntry
+	var active []shrimptypes.IndexEntry
 	for _, entry := range merged {
 		if _, ok := activeDataIDs[entry.DataID]; ok {
 			active = append(active, entry)
 		}
 	}
 
-	slices.SortFunc(active, func(a, b IndexEntry) int {
+	slices.SortFunc(active, func(a, b shrimptypes.IndexEntry) int {
 		if c := cmp.Compare(a.Token, b.Token); c != 0 {
 			return c
 		}
 		return cmp.Compare(a.DataID, b.DataID)
 	})
-	active = slices.CompactFunc(active, func(a, b IndexEntry) bool {
+	active = slices.CompactFunc(active, func(a, b shrimptypes.IndexEntry) bool {
 		return a.Token == b.Token && a.DataID == b.DataID
 	})
 
@@ -543,24 +320,25 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		oldSet[p.ID] = true
 	}
 
-	var next []IndexPartMeta
+	var next []shrimptypes.IndexPartMeta
 	for _, p := range e.parts {
 		if !oldSet[p.ID] {
 			next = append(next, p)
 		}
 	}
 
+	compression := shrimpblock.CompressionZstd
 	if len(active) > 0 {
 		id := fmt.Sprintf("%d-%s-compact", time.Now().UnixNano(), e.nodeID)
 		indexDir := filepath.Join(e.dataDir, "index")
 		path := filepath.Join(indexDir, id+".json")
 		metaPath := filepath.Join(indexDir, id+".meta")
 
-		if err := writeIndexBlock(path, IndexBlock{Entries: active}, compressionZstd); err != nil {
+		if err := shrimpblock.WriteIndexBlock(path, shrimptypes.IndexBlock{Entries: active}, compression); err != nil {
 			return fmt.Errorf("write compacted index block: %w", err)
 		}
 
-		meta := IndexPartMeta{
+		meta := shrimptypes.IndexPartMeta{
 			ID:          id,
 			NodeID:      e.nodeID,
 			Level:       1,
@@ -568,10 +346,10 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 			MaxToken:    active[len(active)-1].Token,
 			Count:       len(active),
 			CreatedAt:   time.Now().UnixNano(),
-			Compression: compressionZstd,
+			Compression: compression,
 		}
 
-		if err := writeIndexMeta(metaPath, meta); err != nil {
+		if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
 			_ = os.Remove(path)
 			return fmt.Errorf("write compacted index meta: %w", err)
 		}
@@ -604,7 +382,7 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 }
 
 // Lookup queries the index for matching data part IDs.
-func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []PartMeta) (matchedIDs map[string]struct{}, complete bool, err error) {
+func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []shrimptypes.PartMeta) (matchedIDs map[string]struct{}, complete bool, err error) {
 	if term == "" {
 		return nil, false, nil
 	}
@@ -623,7 +401,7 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []Part
 	}
 
 	var tokens []string
-	for tok := range tokenize(term) {
+	for tok := range shrimpblock.Tokenize(term) {
 		tokens = append(tokens, tok)
 	}
 	if len(tokens) == 0 {
@@ -647,7 +425,7 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []Part
 			block, ok := e.idxBlockCache.Get(blockPath)
 			if !ok {
 				var err error
-				block, err = readIndexBlock(blockPath)
+				block, err = shrimpblock.ReadIndexBlock(blockPath)
 				if err != nil {
 					slog.WarnContext(ctx, "failed to read index block", "path", blockPath, "error", err)
 					return nil, false, err
@@ -655,7 +433,7 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []Part
 				e.idxBlockCache.Set(blockPath, block)
 			}
 
-			idx, found := slices.BinarySearchFunc(block.Entries, tok, func(entry IndexEntry, target string) int {
+			idx, found := slices.BinarySearchFunc(block.Entries, tok, func(entry shrimptypes.IndexEntry, target string) int {
 				return cmp.Compare(entry.Token, target)
 			})
 			if found {
@@ -685,8 +463,8 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []Part
 }
 
 // ReindexPart derives and writes index entries for an existing data part.
-func (e *IndexEngine) ReindexPart(_ context.Context, meta PartMeta, block Block) error {
-	entries := BuildIndexEntries(meta.ID, block.Data)
+func (e *IndexEngine) ReindexPart(_ context.Context, meta shrimptypes.PartMeta, block shrimptypes.Block) error {
+	entries := shrimpblock.BuildIndexEntries(meta.ID, block.Data)
 	if err := e.Write(entries); err != nil {
 		return err
 	}
@@ -699,97 +477,4 @@ func (e *IndexEngine) Close() error {
 		_ = e.Flush(context.Background())
 	}
 	return e.wal.Close()
-}
-
-func readIndexMeta(path string) (IndexPartMeta, error) {
-	f, err := os.Open(path) // #nosec G304 -- trusted internal path
-	if err != nil {
-		return IndexPartMeta{}, err
-	}
-	defer func() { _ = f.Close() }()
-	var meta IndexPartMeta
-	if err := json.NewDecoder(f).Decode(&meta); err != nil {
-		return IndexPartMeta{}, err
-	}
-	return meta, nil
-}
-
-func writeIndexMeta(path string, meta IndexPartMeta) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-index-meta-")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	if err := json.NewEncoder(tmp).Encode(meta); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, path)
-}
-
-func writeIndexBlock(path string, b IndexBlock, algo string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-index-")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	cw, err := newCompressingWriter(tmp, algo)
-	if err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	encErr := json.NewEncoder(cw).Encode(b)
-	closeErr := cw.Close()
-	if encErr != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return encErr
-	}
-	if closeErr != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return closeErr
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, path)
-}
-
-func readIndexBlock(path string) (IndexBlock, error) {
-	f, err := os.Open(path) // #nosec G304 -- trusted internal path
-	if err != nil {
-		return IndexBlock{}, err
-	}
-	r, _, err := openBlockReader(f)
-	if err != nil {
-		_ = f.Close()
-		return IndexBlock{}, err
-	}
-	var b IndexBlock
-	decodeErr := json.NewDecoder(r).Decode(&b)
-	rCloseErr := r.Close()
-	fCloseErr := f.Close()
-	if decodeErr != nil {
-		return IndexBlock{}, decodeErr
-	}
-	if rCloseErr != nil {
-		return IndexBlock{}, rCloseErr
-	}
-	return b, fCloseErr
 }

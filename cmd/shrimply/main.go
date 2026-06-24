@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tdakkota/shrimpd"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
 type otlpScopeJSON struct {
@@ -55,7 +55,7 @@ func parseTime(s string, defaultVal int64) (int64, error) {
 	return 0, fmt.Errorf("invalid time/duration format: %q", s)
 }
 
-func formatEntry(e shrimpd.Entry) string {
+func formatEntry(e shrimptypes.Entry) string {
 	ts := time.Unix(0, e.Timestamp).Format("2006-01-02 15:04:05.000000000")
 
 	// Check if it's OTLP log JSON
@@ -175,7 +175,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	var block shrimpd.Block
+	var block shrimptypes.Block
 	if err := json.NewDecoder(resp.Body).Decode(&block); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to decode response: %v\n", err)
 		os.Exit(1)

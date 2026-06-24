@@ -1,6 +1,7 @@
-package shrimpd
+package shrimpapi
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -12,6 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-faster/jx"
+	"github.com/tdakkota/shrimpd/internal/shrimplication"
+	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
@@ -19,12 +23,12 @@ import (
 
 // Server serves the daemon HTTP API for ingesting, reading, and sharing parts.
 type Server struct {
-	lsm *LSM
+	lsm *shrimplication.LSM
 	srv *http.Server
 }
 
 // NewServer creates a daemon HTTP server bound to addr.
-func NewServer(addr string, lsm *LSM) *Server {
+func NewServer(addr string, lsm *shrimplication.LSM) *Server {
 	mux := http.NewServeMux()
 	s := &Server{lsm: lsm}
 
@@ -73,18 +77,90 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
+// ingestStreamBatch controls how many entries are decoded and written to WAL at
+// a time. Keeping this small bounds peak memory regardless of request body size.
+const ingestStreamBatch = 1000
+
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
-	var block Block
-	if err := json.NewDecoder(r.Body).Decode(&block); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	const (
+		maxIngestBody = 256 << 20 // 256 MiB hard ceiling
+		jxBufSize     = 4096      // jx internal read buffer; covers any single token
+	)
+
+	d := jx.Decode(http.MaxBytesReader(w, r.Body, maxIngestBody), jxBufSize)
+
+	var (
+		batch    []shrimptypes.Entry
+		total    int
+		writeErr error
+	)
+
+	flush := func() {
+		if writeErr != nil || len(batch) == 0 {
+			return
+		}
+		if err := s.lsm.Write(r.Context(), batch); err != nil {
+			writeErr = err
+			return
+		}
+		total += len(batch)
+		batch = batch[:0]
+	}
+
+	// Stream-decode {"data":[{"timestamp":N,"data":"..."},...]} entry by entry.
+	decodeErr := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
+		if string(key) != "data" {
+			return d.Skip()
+		}
+		return d.Arr(func(d *jx.Decoder) error {
+			if writeErr != nil {
+				return writeErr
+			}
+			var e shrimptypes.Entry
+			if err := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
+				switch string(key) {
+				case "timestamp":
+					v, err := d.Int64()
+					if err != nil {
+						return err
+					}
+					e.Timestamp = v
+				case "data":
+					v, err := d.Str()
+					if err != nil {
+						return err
+					}
+					e.Data = v
+				default:
+					return d.Skip()
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			batch = append(batch, e)
+			if len(batch) >= ingestStreamBatch {
+				flush()
+			}
+			return writeErr
+		})
+	})
+
+	if decodeErr != nil {
+		http.Error(w, decodeErr.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(block.Data) == 0 {
+	if writeErr != nil {
+		http.Error(w, writeErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	flush() // flush remaining tail
+	if writeErr != nil {
+		http.Error(w, writeErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	if total == 0 {
 		http.Error(w, "empty block", http.StatusBadRequest)
-		return
-	}
-	if err := s.lsm.Write(r.Context(), block.Data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -146,7 +222,7 @@ func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var entries []Entry
+	var entries []shrimptypes.Entry
 	now := time.Now().UnixNano()
 
 	rls := logsData.ResourceLogs()
@@ -207,7 +283,7 @@ func (s *Server) handleIngestOTLP(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				entries = append(entries, Entry{
+				entries = append(entries, shrimptypes.Entry{
 					Timestamp: int64(ts),
 					Data:      string(dataBytes),
 				})
@@ -248,14 +324,38 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	to := parseIntParam(q.Get("to"), 1<<62)
 	term := q.Get("term")
 
-	entries, err := s.lsm.Query(r.Context(), from, to, term)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(Block{Data: entries}); err != nil {
-		slog.WarnContext(r.Context(), "encode query response", "error", err)
+	// Stream response: never accumulate a []Entry result slice.
+	// Peak memory = O(one decoded block) regardless of match count.
+	bw := bufio.NewWriterSize(w, 64<<10)
+	_, _ = bw.WriteString(`{"data":[`)
+
+	first := true
+	jw := jx.GetWriter()
+	defer jx.PutWriter(jw)
+
+	err := s.lsm.QueryStream(r.Context(), from, to, term, func(e shrimptypes.Entry) error {
+		jw.Reset()
+		jw.ObjStart()
+		jw.RawStr(`"timestamp":`)
+		jw.Int64(e.Timestamp)
+		jw.RawStr(`,"data":`)
+		jw.Str(e.Data)
+		jw.ObjEnd()
+		if !first {
+			_ = bw.WriteByte(',')
+		}
+		first = false
+		_, err := bw.Write(jw.Buf)
+		return err
+	})
+	if err != nil {
+		slog.WarnContext(r.Context(), "stream query", "error", err)
+	}
+
+	_, _ = bw.WriteString(`]}`)
+	if err := bw.Flush(); err != nil {
+		slog.WarnContext(r.Context(), "flush query response", "error", err)
 	}
 }
 
