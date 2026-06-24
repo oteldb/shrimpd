@@ -196,7 +196,7 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		must.NoError(err)
 		flushResp, err := http.DefaultClient.Do(flushReq)
 		must.NoError(err)
-		must.Equal(http.StatusOK, flushResp.StatusCode)
+		must.Equal(http.StatusNoContent, flushResp.StatusCode)
 		flushResp.Body.Close()
 		time.Sleep(100 * time.Millisecond) // wait for async flush + index write
 

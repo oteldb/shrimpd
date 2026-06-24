@@ -3,6 +3,7 @@ package shrimpblock
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -124,4 +125,82 @@ func TestVerifyPartV2RejectsCorruptBlock(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	require.Error(t, VerifyPartV2(pf))
+}
+
+func TestMergeParts(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{
+		filepath.Join(dir, "p1.json"),
+		filepath.Join(dir, "p2.json"),
+		filepath.Join(dir, "p3.json"),
+	}
+	inputs := [][]shrimptypes.Entry{
+		{{Timestamp: 1, Data: "a1"}, {Timestamp: 4, Data: "a4"}},
+		{{Timestamp: 2, Data: "b2"}, {Timestamp: 5, Data: "b5"}},
+		{{Timestamp: 3, Data: "c3"}, {Timestamp: 6, Data: "c6"}},
+	}
+	parts := make([]*PartFileV2, 0, len(paths))
+	for i, path := range paths {
+		_, err := WritePartV2(path, inputs[i])
+		require.NoError(t, err)
+		pf, err := OpenPartV2(path, shrimptypes.PartMeta{FormatVersion: 1})
+		require.NoError(t, err)
+		parts = append(parts, pf)
+	}
+
+	var got []int64
+	for e, err := range MergeParts(parts) {
+		require.NoError(t, err)
+		got = append(got, e.Timestamp)
+	}
+	require.Equal(t, []int64{1, 2, 3, 4, 5, 6}, got)
+}
+
+func TestWritePartV2FromIter(t *testing.T) {
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.json")
+	pathB := filepath.Join(dir, "b.json")
+	entries := []shrimptypes.Entry{
+		{Timestamp: 1, Data: `{"body":"hello world"}`},
+		{Timestamp: 2, Data: `{"body":"error panic"}`},
+		{Timestamp: 3, Data: `{"body":"debug info"}`},
+		{Timestamp: 4, Data: `{"body":"service name"}`},
+	}
+
+	_, err := WritePartV2(pathA, entries)
+	require.NoError(t, err)
+	_, err = WritePartV2Seq(pathB, func(yield func(shrimptypes.Entry, error) bool) {
+		for _, e := range entries {
+			if !yield(e, nil) {
+				return
+			}
+		}
+	}, 2, nil)
+	require.NoError(t, err)
+
+	pfA, err := OpenPartV2(pathA, shrimptypes.PartMeta{FormatVersion: 1})
+	require.NoError(t, err)
+	defer pfA.Close()
+	pfB, err := OpenPartV2(pathB, shrimptypes.PartMeta{FormatVersion: 1})
+	require.NoError(t, err)
+	defer pfB.Close()
+
+	gotA := make([]shrimptypes.Entry, 0, len(entries))
+	for i := range pfA.Headers {
+		rb, err := ReadRowBlock(pfA, i)
+		require.NoError(t, err)
+		for j := range rb.Timestamps {
+			gotA = append(gotA, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
+		}
+	}
+	gotB := make([]shrimptypes.Entry, 0, len(entries))
+	for i := range pfB.Headers {
+		rb, err := ReadRowBlock(pfB, i)
+		require.NoError(t, err)
+		for j := range rb.Timestamps {
+			gotB = append(gotB, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
+		}
+	}
+	require.True(t, slices.Equal(gotA, gotB))
+	require.Equal(t, entries, gotB)
 }

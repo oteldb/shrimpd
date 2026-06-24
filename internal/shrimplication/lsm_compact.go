@@ -1,7 +1,6 @@
 package shrimplication
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -83,7 +82,7 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		levelParts = levelParts[:compactTrigger]
 	}
 
-	var merged []shrimptypes.Entry
+	var pfs []*shrimpblock.PartFileV2
 	for _, meta := range levelParts {
 		pf, err := l.partMgr.Get(meta.ID, meta)
 		if err != nil {
@@ -92,23 +91,16 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		if pf == nil {
 			return fmt.Errorf("v2 part not available: %s", meta.ID)
 		}
-		for i := range pf.Headers {
-			rb, err := shrimpblock.ReadRowBlock(pf, i)
-			if err != nil {
-				return fmt.Errorf("read block %s[%d]: %w", meta.ID, i, err)
-			}
-			for j := range rb.Timestamps {
-				merged = append(merged, shrimptypes.Entry{Timestamp: rb.Timestamps[j], Data: rb.Data[j]})
-			}
-		}
+		pfs = append(pfs, pf)
 	}
-	if len(merged) == 0 {
-		if force {
-			slog.DebugContext(ctx, "compaction skipped: no data in parts", "level", level)
-		}
-		return nil
-	}
-	slices.SortFunc(merged, func(a, b shrimptypes.Entry) int { return cmp.Compare(a.Timestamp, b.Timestamp) })
+	mergedIt := shrimpblock.MergeParts(pfs)
+	var (
+		count      int
+		minTS      int64
+		maxTS      int64
+		tokenSet   = make(map[string]struct{})
+		seenAnyRow bool
+	)
 
 	oldIDs := make([]string, len(levelParts))
 	for i, p := range levelParts {
@@ -119,20 +111,48 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 	path := l.partPath(id)
 	metaPath := l.partMetaPath(id)
 
-	blockHeaders, err := shrimpblock.WritePartV2(path, merged)
+	blockHeaders, err := shrimpblock.WritePartV2Seq(path, mergedIt, shrimpblock.DefaultV2BlockRows, func(block []shrimptypes.Entry) error {
+		if len(block) == 0 {
+			return nil
+		}
+		if !seenAnyRow {
+			minTS = block[0].Timestamp
+			seenAnyRow = true
+		}
+		maxTS = block[len(block)-1].Timestamp
+		count += len(block)
+		for _, e := range block {
+			for tok := range shrimpblock.Tokenize(e.Data) {
+				tokenSet[tok] = struct{}{}
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("write v2 part: %w", err)
 	}
+	if count == 0 {
+		_ = os.Remove(path)
+		if force {
+			slog.DebugContext(ctx, "compaction skipped: no data in parts", "level", level)
+		}
+		return nil
+	}
+	tokens := make([]string, 0, len(tokenSet))
+	for tok := range tokenSet {
+		tokens = append(tokens, tok)
+	}
+	slices.Sort(tokens)
 
 	meta := shrimptypes.PartMeta{
 		ID:            id,
 		NodeID:        l.nodeID,
 		Level:         level + 1,
-		MinTimestamp:  merged[0].Timestamp,
-		MaxTimestamp:  merged[len(merged)-1].Timestamp,
-		Count:         len(merged),
+		MinTimestamp:  minTS,
+		MaxTimestamp:  maxTS,
+		Count:         count,
 		Addr:          l.addr,
-		Tokens:        shrimpblock.BuildTokenSet(merged),
+		Tokens:        tokens,
 		Compression:   shrimpblock.CompressionZstd,
 		FormatVersion: 1,
 		BlockCount:    len(blockHeaders),
@@ -143,8 +163,7 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		return fmt.Errorf("write meta: %w", err)
 	}
 
-	slog.DebugContext(ctx, "compacting parts", "old_ids", oldIDs, "new_id", id, "level", level, "new_level", level+1, "count", len(merged))
-
+	slog.DebugContext(ctx, "compacting parts", "old_ids", oldIDs, "new_id", id, "level", level, "new_level", level+1, "count", count)
 	if _, err := l.reg.AppendLog(ctx, OpMerge, meta, oldIDs); err != nil {
 		_ = os.Remove(path)
 		_ = os.Remove(metaPath)
@@ -172,7 +191,10 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 	l.parts = next
 	l.mu.Unlock()
 
-	idxEntries := shrimpblock.BuildIndexEntries(meta.ID, merged)
+	idxEntries := make([]shrimptypes.IndexEntry, len(tokens))
+	for i, tok := range tokens {
+		idxEntries[i] = shrimptypes.IndexEntry{Token: tok, DataID: meta.ID}
+	}
 	if err := l.idxEngine.Write(idxEntries); err != nil {
 		slog.WarnContext(ctx, "failed to write index entries on compaction", "id", meta.ID, "error", err)
 	} else {
@@ -181,6 +203,6 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		}
 	}
 
-	slog.InfoContext(ctx, "compacted parts", "level", level, "count", len(levelParts), "id", id, "new_level", level+1, "entry_count", len(merged))
+	slog.InfoContext(ctx, "compacted parts", "level", level, "count", len(levelParts), "id", id, "new_level", level+1, "entry_count", count)
 	return nil
 }

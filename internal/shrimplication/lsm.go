@@ -24,6 +24,18 @@ const (
 
 var remoteHTTP = &http.Client{Timeout: 10 * time.Second}
 
+type registryAPI interface {
+	RegisterNode(ctx context.Context, addr string) error
+	AppendLog(ctx context.Context, op LogOp, part shrimptypes.PartMeta, oldParts []string) (int64, error)
+	GetLogs(ctx context.Context, fromIndex int64) ([]LogEntry, error)
+	GetActiveParts(ctx context.Context) (map[string]shrimptypes.PartMeta, error)
+	GetBootstrapSnapshot(ctx context.Context) (BootstrapSnapshot, error)
+	logEntryExists(ctx context.Context, idx int64) (bool, error)
+	LogCleanupLoop(ctx context.Context)
+	GetQueuePointer(ctx context.Context) (int64, error)
+	SetQueuePointer(ctx context.Context, index int64) error
+}
+
 // LSM owns local writes, local parts, compaction, and distributed reads.
 type LSM struct {
 	nodeID  string
@@ -32,7 +44,7 @@ type LSM struct {
 
 	mem *MemTable
 	wal *shrimpwal.WAL
-	reg *Registry
+	reg registryAPI
 	// writeMu makes "snapshot the memtable + seal the WAL" atomic with respect to
 	// concurrent Write, so the sealed segment's contents exactly match the snapshot.
 	// Held only across that brief boundary, never across the heavy flush I/O.
@@ -69,7 +81,7 @@ func (l *LSM) SetParts(parts []shrimptypes.PartMeta) {
 }
 
 // NewLSM creates an LSM instance and replays unflushed entries from the WAL.
-func NewLSM(nodeID, addr, dataDir string, wal *shrimpwal.WAL, reg *Registry) (*LSM, error) {
+func NewLSM(nodeID, addr, dataDir string, wal *shrimpwal.WAL, reg registryAPI) (*LSM, error) {
 	idx, err := NewIndexEngine(nodeID, dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("new index engine: %w", err)

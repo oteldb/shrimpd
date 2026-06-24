@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 	"path/filepath"
 	"slices"
@@ -24,6 +25,10 @@ const (
 	v2HeaderSize  = 16   // 4 + 1 + 3 + 8
 	v2BlockDirRow = 1096 // per-block directory entry size
 	v2BlockRows   = 512  // default rows per block
+
+	// DefaultV2BlockRows is the default streaming block size for callers outside
+	// this package.
+	DefaultV2BlockRows = v2BlockRows
 )
 
 // PartFileV2 holds an open file descriptor and its block directory in memory.
@@ -38,71 +43,66 @@ type PartFileV2 struct {
 // compresses each block independently, and writes the header + directory + data.
 // Returns the written headers.
 func WritePartV2(path string, entries []shrimptypes.Entry) ([]shrimptypes.BlockHeader, error) {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-v2-")
+	return WritePartV2Seq(path, entriesSeq(entries), v2BlockRows, nil)
+}
+
+func entriesSeq(entries []shrimptypes.Entry) iter.Seq2[shrimptypes.Entry, error] {
+	return func(yield func(shrimptypes.Entry, error) bool) {
+		for _, e := range entries {
+			if !yield(e, nil) {
+				return
+			}
+		}
+	}
+}
+
+// WritePartV2Seq streams entries into a V2 part without materializing all rows.
+func WritePartV2Seq(path string, it iter.Seq2[shrimptypes.Entry, error], blockSize int, cb func([]shrimptypes.Entry) error) ([]shrimptypes.BlockHeader, error) {
+	return writePartV2Seq(path, it, blockSize, cb)
+}
+
+func writePartV2Seq(path string, it iter.Seq2[shrimptypes.Entry, error], blockSize int, cb func([]shrimptypes.Entry) error) ([]shrimptypes.BlockHeader, error) {
+	if blockSize <= 0 {
+		blockSize = v2BlockRows
+	}
+
+	payloadTmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-v2-payload-")
 	if err != nil {
-		return nil, fmt.Errorf("create temp: %w", err)
+		return nil, fmt.Errorf("create payload temp: %w", err)
 	}
-	name := tmp.Name()
+	payloadName := payloadTmp.Name()
+	defer func() { _ = payloadTmp.Close(); _ = os.Remove(payloadName) }()
 
-	blockCount := (len(entries) + v2BlockRows - 1) / v2BlockRows
-	if blockCount == 0 {
-		blockCount = 1
-	}
-	blocks := make([][]shrimptypes.Entry, 0, blockCount)
-	for i := 0; i < len(entries); i += v2BlockRows {
-		end := min(i+v2BlockRows, len(entries))
-		blocks = append(blocks, entries[i:end])
-	}
-
-	headers := make([]shrimptypes.BlockHeader, len(blocks))
-
-	// Write magic header placeholder
-	headerBuf := make([]byte, v2HeaderSize)
-	copy(headerBuf[0:4], MagicShrimp)
-	headerBuf[4] = v2Version
-	// reserved: bytes 5-7 are zero
-	binary.LittleEndian.PutUint64(headerBuf[8:16], uint64(len(blocks)))
-
-	if _, err := tmp.Write(headerBuf); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return nil, fmt.Errorf("write header: %w", err)
-	}
-
-	// Write block directory placeholder
-	dirOffset := int64(v2HeaderSize)
-	dirSize := int64(len(blocks)) * v2BlockDirRow
-	if _, err := tmp.Write(make([]byte, dirSize)); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
-		return nil, fmt.Errorf("write dir placeholder: %w", err)
-	}
-
-	// Write each block
-	payloadOffset := dirOffset + dirSize
 	enc := encoderPool.Get().(*zstd.Encoder)
 	defer encoderPool.Put(enc)
 
-	var binBuf []byte
+	var (
+		buf     = make([]shrimptypes.Entry, 0, blockSize)
+		headers []shrimptypes.BlockHeader
+		offset  int64
+	)
 
-	for bi, block := range blocks {
-		binBuf = EncodeBinBlock(block, binBuf[:0])
-
-		enc.Reset(tmp)
+	flushBlock := func(block []shrimptypes.Entry) error {
+		if len(block) == 0 {
+			return nil
+		}
+		if cb != nil {
+			if err := cb(block); err != nil {
+				return err
+			}
+		}
+		binBuf := EncodeBinBlock(block, nil)
+		enc.Reset(payloadTmp)
 		if _, err := enc.Write(binBuf); err != nil {
-			_ = tmp.Close()
-			_ = os.Remove(name)
-			return nil, fmt.Errorf("compress block: %w", err)
+			return fmt.Errorf("compress block: %w", err)
 		}
 		if err := enc.Close(); err != nil {
-			_ = tmp.Close()
-			_ = os.Remove(name)
-			return nil, fmt.Errorf("close zstd: %w", err)
+			return fmt.Errorf("close zstd: %w", err)
 		}
-		compressedEnd, _ := tmp.Seek(0, io.SeekCurrent)
-		compressedSz := compressedEnd - payloadOffset
-
-		// Build bloom filter from block entries
+		end, err := payloadTmp.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return err
+		}
 		var bloom shrimptypes.BloomFilter
 		for _, e := range block {
 			for tok := range Tokenize(e.Data) {
@@ -113,47 +113,85 @@ func WritePartV2(path string, entries []shrimptypes.Entry) ([]shrimptypes.BlockH
 				BloomAddLabel(&bloom, k, v)
 			}
 		}
-
-		headers[bi] = shrimptypes.BlockHeader{
-			Offset:       payloadOffset,
-			CompressedSz: compressedSz,
+		headers = append(headers, shrimptypes.BlockHeader{
+			Offset:       offset,
+			CompressedSz: end - offset,
 			Count:        int32(len(block)),
 			MinTimestamp: block[0].Timestamp,
 			MaxTimestamp: block[len(block)-1].Timestamp,
 			Bloom:        bloom,
-		}
-
-		payloadOffset = compressedEnd
+		})
+		offset = end
+		return nil
 	}
 
-	// Rewrite block directory
+	for e, err := range it {
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, e)
+		if len(buf) == blockSize {
+			if err := flushBlock(buf); err != nil {
+				return nil, err
+			}
+			buf = buf[:0]
+		}
+	}
+	if len(buf) > 0 {
+		if err := flushBlock(buf); err != nil {
+			return nil, err
+		}
+	}
+
+	finalTmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-v2-")
+	if err != nil {
+		return nil, fmt.Errorf("create temp: %w", err)
+	}
+	finalName := finalTmp.Name()
+	defer func() { _ = finalTmp.Close(); _ = os.Remove(finalName) }()
+
+	headerBuf := make([]byte, v2HeaderSize)
+	copy(headerBuf[0:4], MagicShrimp)
+	headerBuf[4] = v2Version
+	binary.LittleEndian.PutUint64(headerBuf[8:16], uint64(len(headers)))
+	if _, err := finalTmp.Write(headerBuf); err != nil {
+		return nil, fmt.Errorf("write header: %w", err)
+	}
+
+	dirOffset := int64(v2HeaderSize)
+	dirSize := int64(len(headers)) * v2BlockDirRow
+	if _, err := finalTmp.Write(make([]byte, dirSize)); err != nil {
+		return nil, fmt.Errorf("write dir placeholder: %w", err)
+	}
+
+	if _, err := payloadTmp.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(finalTmp, payloadTmp); err != nil {
+		return nil, err
+	}
+
 	dirBuf := make([]byte, dirSize)
+	baseOffset := dirOffset + dirSize
 	for bi, h := range headers {
 		row := dirBuf[bi*v2BlockDirRow : (bi+1)*v2BlockDirRow]
-		binary.LittleEndian.PutUint64(row[0:8], uint64(h.Offset))
+		binary.LittleEndian.PutUint64(row[0:8], uint64(baseOffset+h.Offset))
 		binary.LittleEndian.PutUint64(row[8:16], uint64(h.CompressedSz))
 		binary.LittleEndian.PutUint32(row[16:20], uint32(h.Count))
 		binary.LittleEndian.PutUint64(row[20:28], uint64(h.MinTimestamp))
 		binary.LittleEndian.PutUint64(row[28:36], uint64(h.MaxTimestamp))
 		copy(row[36:1060], h.Bloom[:])
 	}
-
-	if _, err := tmp.WriteAt(dirBuf, dirOffset); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
+	if _, err := finalTmp.WriteAt(dirBuf, dirOffset); err != nil {
 		return nil, fmt.Errorf("write dir: %w", err)
 	}
-
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(name)
+	if err := finalTmp.Sync(); err != nil {
 		return nil, err
 	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(name)
+	if err := finalTmp.Close(); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(name, path); err != nil {
+	if err := os.Rename(finalName, path); err != nil {
 		return nil, err
 	}
 	if err := fsyncutil.SyncDir(filepath.Dir(path)); err != nil {

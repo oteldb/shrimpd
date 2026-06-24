@@ -57,7 +57,6 @@ func (l *LSM) flush(ctx context.Context) error {
 		l.mem.Write(entries) // nothing was sealed; put entries back for a later retry
 		return fmt.Errorf("seal wal: %w", sealErr)
 	}
-
 	slices.SortFunc(entries, func(a, b shrimptypes.Entry) int { return cmp.Compare(a.Timestamp, b.Timestamp) })
 
 	id := newPartID(l.nodeID)
@@ -65,7 +64,6 @@ func (l *LSM) flush(ctx context.Context) error {
 	metaPath := l.partMetaPath(id)
 
 	slog.DebugContext(ctx, "creating new part", "id", id, "count", len(entries))
-
 	blockHeaders, err := shrimpblock.WritePartV2(path, entries)
 	if err != nil {
 		l.restoreAfterFailedFlush(entries) // keep sealed segment as the durable copy
