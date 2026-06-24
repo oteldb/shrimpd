@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/go-faster/jx"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
 
@@ -115,8 +116,45 @@ func ReadIndexBlock(path string) (shrimptypes.IndexBlock, error) {
 		_ = f.Close()
 		return shrimptypes.IndexBlock{}, err
 	}
+	d := jx.GetDecoder()
+	defer jx.PutDecoder(d)
+	d.Reset(r)
+
 	var b shrimptypes.IndexBlock
-	decodeErr := json.NewDecoder(r).Decode(&b)
+	decodeErr := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
+		switch string(key) {
+		case "entries":
+			return d.Arr(func(d *jx.Decoder) error {
+				var e shrimptypes.IndexEntry
+				if err := d.ObjBytes(func(d *jx.Decoder, key []byte) error {
+					switch string(key) {
+					case "token":
+						v, err := d.Str()
+						if err != nil {
+							return err
+						}
+						e.Token = v
+					case "data_id":
+						v, err := d.Str()
+						if err != nil {
+							return err
+						}
+						e.DataID = v
+					default:
+						return d.Skip()
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
+				b.Entries = append(b.Entries, e)
+				return nil
+			})
+		default:
+			return d.Skip()
+		}
+	})
+
 	rCloseErr := r.Close()
 	fCloseErr := f.Close()
 	if decodeErr != nil {
