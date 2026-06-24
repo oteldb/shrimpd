@@ -1,4 +1,4 @@
-// package shrimplication provides a small LSM-backed distributed log store.
+// Package shrimplication provides a small LSM-backed distributed log store.
 package shrimplication
 
 import (

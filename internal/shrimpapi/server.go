@@ -1,3 +1,4 @@
+// Package shrimpapi implements the HTTP API for the shrimpd daemon.
 package shrimpapi
 
 import (
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-faster/jx"
+	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimplication"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -324,6 +326,49 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	to := parseIntParam(q.Get("to"), 1<<62)
 	term := q.Get("term")
 
+	var m shrimpfilter.Matcher
+	if qstr := q.Get("q"); qstr != "" {
+		var qf struct {
+			Line []struct {
+				Op string `json:"op"`
+				V  string `json:"v"`
+			} `json:"line"`
+			Labels []struct {
+				L  string `json:"l"`
+				Op string `json:"op"`
+				V  string `json:"v"`
+			} `json:"labels"`
+		}
+		if err := json.Unmarshal([]byte(qstr), &qf); err != nil {
+			http.Error(w, "bad q: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		var lines []shrimpfilter.LineFilter
+		for _, lf := range qf.Line {
+			op, ok := parseLineOp(lf.Op)
+			if !ok {
+				http.Error(w, "bad line op: "+lf.Op, http.StatusBadRequest)
+				return
+			}
+			lines = append(lines, shrimpfilter.LineFilter{Op: op, Value: lf.V})
+		}
+		var labels []shrimpfilter.LabelFilter
+		for _, lf := range qf.Labels {
+			op, ok := parseLabelOp(lf.Op)
+			if !ok {
+				http.Error(w, "bad label op: "+lf.Op, http.StatusBadRequest)
+				return
+			}
+			labels = append(labels, shrimpfilter.LabelFilter{Label: lf.L, Op: op, Value: lf.V})
+		}
+		var err error
+		m, err = shrimpfilter.CompileMatcher(lines, labels)
+		if err != nil {
+			http.Error(w, "bad matcher: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	// Stream response: never accumulate a []Entry result slice.
 	// Peak memory = O(one decoded block) regardless of match count.
@@ -334,7 +379,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	jw := jx.GetWriter()
 	defer jx.PutWriter(jw)
 
-	err := s.lsm.QueryStream(r.Context(), from, to, term, func(e shrimptypes.Entry) error {
+	var err error
+	emit := func(e shrimptypes.Entry) error {
 		jw.Reset()
 		jw.ObjStart()
 		jw.RawStr(`"timestamp":`)
@@ -343,20 +389,77 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		jw.Str(e.Data)
 		jw.ObjEnd()
 		if !first {
-			_ = bw.WriteByte(',')
+			jw.Comma()
 		}
 		first = false
-		_, err := bw.Write(jw.Buf)
-		return err
-	})
-	if err != nil {
-		slog.WarnContext(r.Context(), "stream query", "error", err)
+		_, werr := bw.Write(jw.Buf)
+		return werr
 	}
+	if q.Get("q") != "" {
+		var stats *shrimptypes.QueryStats
+		stats, err = s.lsm.QueryMatcherWithStats(r.Context(), from, to, m, emit)
+		if err != nil {
+			slog.WarnContext(r.Context(), "stream query", "error", err)
+		}
 
-	_, _ = bw.WriteString(`]}`)
-	if err := bw.Flush(); err != nil {
-		slog.WarnContext(r.Context(), "flush query response", "error", err)
+		_, _ = bw.WriteString(`],"stats":`)
+		if statsBytes, merr := json.Marshal(stats); merr == nil {
+			_, _ = bw.Write(statsBytes)
+		} else {
+			_, _ = bw.WriteString(`null`)
+		}
+		_, _ = bw.WriteString(`}`)
+		if ferr := bw.Flush(); ferr != nil {
+			slog.WarnContext(r.Context(), "flush query response", "error", ferr)
+		}
+		return
+	} else {
+		var stats *shrimptypes.QueryStats
+		stats, err = s.lsm.QueryStreamWithStats(r.Context(), from, to, term, emit)
+		if err != nil {
+			slog.WarnContext(r.Context(), "stream query", "error", err)
+		}
+
+		_, _ = bw.WriteString(`],"stats":`)
+		if statsBytes, merr := json.Marshal(stats); merr == nil {
+			_, _ = bw.Write(statsBytes)
+		} else {
+			_, _ = bw.WriteString(`null`)
+		}
+		_, _ = bw.WriteString(`}`)
+		if ferr := bw.Flush(); ferr != nil {
+			slog.WarnContext(r.Context(), "flush query response", "error", ferr)
+		}
+		return
 	}
+}
+
+func parseLineOp(s string) (shrimpfilter.LineOp, bool) {
+	switch s {
+	case "|=", "eq":
+		return shrimpfilter.OpLineEq, true
+	case "!=", "ne":
+		return shrimpfilter.OpLineNotEq, true
+	case "|~", "re":
+		return shrimpfilter.OpLineRe, true
+	case "!~", "nre":
+		return shrimpfilter.OpLineNotRe, true
+	}
+	return 0, false
+}
+
+func parseLabelOp(s string) (shrimpfilter.LabelOp, bool) {
+	switch s {
+	case "eq":
+		return shrimpfilter.OpLabelEq, true
+	case "ne":
+		return shrimpfilter.OpLabelNotEq, true
+	case "re":
+		return shrimpfilter.OpLabelRe, true
+	case "nre":
+		return shrimpfilter.OpLabelNotRe, true
+	}
+	return 0, false
 }
 
 func (s *Server) handlePart(w http.ResponseWriter, r *http.Request) {

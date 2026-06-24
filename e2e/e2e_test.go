@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -194,6 +195,9 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		var qHello shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=hello", &qHello)
 		must.Len(qHello.Data, 1)
+		must.NotNil(qHello.Stats)
+		must.GreaterOrEqual(qHello.Stats.DurationMs, int64(0))
+		must.GreaterOrEqual(qHello.Stats.PartsTotal, qHello.Stats.PartsScanned)
 
 		var qOTLP shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=otlp", &qOTLP)
@@ -202,6 +206,28 @@ func TestDaemonSmokeOTLP(t *testing.T) {
 		var qMiss shrimptypes.Block
 		getJSON(ctx, t, baseURL+"/query?from=1719080000000000000&to=1719080000000000000&term=nonexistent", &qMiss)
 		must.Len(qMiss.Data, 0)
+
+		// Matcher (q) tests: label eq + re, line regex, and zero-result not-match.
+		qLabelEq := baseURL + "/query?from=1719080000000000000&to=1719080000000000000&q=" + url.QueryEscape(`{"labels":[{"l":"service_name","op":"eq","v":"test-service"}]}`)
+		var qLE shrimptypes.Block
+		getJSON(ctx, t, qLabelEq, &qLE)
+		must.Len(qLE.Data, 1)
+		must.NotNil(qLE.Stats)
+
+		qLabelRe := baseURL + "/query?from=1719080000000000000&to=1719080000000000000&q=" + url.QueryEscape(`{"labels":[{"l":"level","op":"re","v":"IN.*"}]}`)
+		var qLR shrimptypes.Block
+		getJSON(ctx, t, qLabelRe, &qLR)
+		must.Len(qLR.Data, 1)
+
+		qLineRe := baseURL + "/query?from=1719080000000000000&to=1719080000000000000&q=" + url.QueryEscape(`{"line":[{"op":"|~","v":"hello.*OTLP"}]}`)
+		var qLine shrimptypes.Block
+		getJSON(ctx, t, qLineRe, &qLine)
+		must.Len(qLine.Data, 1)
+
+		qNoMatch := baseURL + "/query?from=1719080000000000000&to=1719080000000000000&q=" + url.QueryEscape(`{"labels":[{"l":"service_name","op":"eq","v":"no-such"}]}`)
+		var qNM shrimptypes.Block
+		getJSON(ctx, t, qNoMatch, &qNM)
+		must.Len(qNM.Data, 0)
 	})
 	t.Run("OTLP_Proto", func(t *testing.T) {
 		// Test OTLP Protobuf ingestion

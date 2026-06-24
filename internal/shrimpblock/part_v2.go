@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-faster/jx"
+	"github.com/tdakkota/shrimpd/internal/shrimpfilter"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 
 	"github.com/klauspost/compress/zstd"
@@ -311,10 +312,10 @@ func ReadRowBlock(pf *PartFileV2, idx int) (*shrimptypes.RowBlock, error) {
 	}, nil
 }
 
-// streamRowBlock decompresses block idx and calls fn for each entry that passes
-// the timestamp range and term filter. Unlike readRowBlock, no RowBlock is built
-// and no result slice is accumulated: only one string is allocated per matching
-// entry via string(StrBytes(…)). The decoded buffer is discarded after return.
+// StreamRowBlock decompresses block idx and calls fn for each entry that passes
+// the timestamp range and term filter. No RowBlock is built and no result slice
+// is accumulated: only one string is allocated per matching entry via
+// string(StrBytes(…)). The decoded buffer is discarded after return.
 //
 // Two-pass decode: pass 1 collects all timestamps (int64, zero string allocs),
 // pass 2 calls StrBytes per data element — a subslice of the decoded buffer for
@@ -338,7 +339,6 @@ func StreamRowBlock(pf *PartFileV2, idx int, from, to int64, term string, fn fun
 		return fmt.Errorf("decompress block %d: %w", idx, err)
 	}
 
-	// Pass 1: collect timestamps (int64 — no string allocations).
 	var timestamps []int64
 	jd1 := jx.DecodeBytes(decoded)
 	if err := jd1.ObjBytes(func(jd *jx.Decoder, key []byte) error {
@@ -356,9 +356,6 @@ func StreamRowBlock(pf *PartFileV2, idx int, from, to int64, term string, fn fun
 		return fmt.Errorf("decode ts block %d: %w", idx, err)
 	}
 
-	// Pass 2: decode data strings with StrBytes (subslice of decoded — no alloc for
-	// plain strings). Skip the string entirely for out-of-range timestamps. Only
-	// call string(sb) for entries that actually match.
 	j := 0
 	jd2 := jx.DecodeBytes(decoded)
 	return jd2.ObjBytes(func(jd *jx.Decoder, key []byte) error {
@@ -382,6 +379,81 @@ func StreamRowBlock(pf *PartFileV2, idx int, from, to int64, term string, fn fun
 				return nil
 			}
 			return fn(shrimptypes.Entry{Timestamp: ts, Data: string(sb)})
+		})
+	})
+}
+
+// StreamRowBlockMatcher is like StreamRowBlock but applies a shrimpfilter.Matcher
+// as a post-filter. Line filters run on StrBytes subslice; only survivors allocate
+// via string(sb) and then run label extraction + MatchLabels.
+func StreamRowBlockMatcher(pf *PartFileV2, idx int, from, to int64, m shrimpfilter.Matcher, fn func(shrimptypes.Entry) error) error {
+	if idx < 0 || idx >= len(pf.Headers) {
+		return fmt.Errorf("block index %d out of range (0-%d)", idx, len(pf.Headers)-1)
+	}
+	hdr := pf.Headers[idx]
+
+	compressed := make([]byte, hdr.CompressedSz)
+	if _, err := pf.fd.ReadAt(compressed, hdr.Offset); err != nil {
+		return fmt.Errorf("read block %d: %w", idx, err)
+	}
+
+	dec := decoderPool.Get().(*zstd.Decoder)
+	decoded, err := dec.DecodeAll(compressed, nil)
+	_ = dec.Reset(nil)
+	decoderPool.Put(dec)
+	if err != nil {
+		return fmt.Errorf("decompress block %d: %w", idx, err)
+	}
+
+	// Pass 1: timestamps
+	var timestamps []int64
+	jd1 := jx.DecodeBytes(decoded)
+	if err := jd1.ObjBytes(func(jd *jx.Decoder, key []byte) error {
+		if string(key) == "ts" {
+			return jd.Arr(func(jd *jx.Decoder) error {
+				v, err := jd.Int64()
+				if err == nil {
+					timestamps = append(timestamps, v)
+				}
+				return err
+			})
+		}
+		return jd.Skip()
+	}); err != nil {
+		return fmt.Errorf("decode ts block %d: %w", idx, err)
+	}
+
+	// Pass 2: StrBytes + matcher
+	j := 0
+	jd2 := jx.DecodeBytes(decoded)
+	return jd2.ObjBytes(func(jd *jx.Decoder, key []byte) error {
+		if string(key) != "d" {
+			return jd.Skip()
+		}
+		return jd.Arr(func(jd *jx.Decoder) error {
+			if j >= len(timestamps) {
+				return jd.Skip()
+			}
+			ts := timestamps[j]
+			j++
+			if ts < from || ts > to {
+				return jd.Skip()
+			}
+			sb, err := jd.StrBytes()
+			if err != nil {
+				return err
+			}
+			if !m.MatchLineBytes(sb) {
+				return nil
+			}
+			s := string(sb)
+			if !m.Empty() && len(m.Labels) > 0 {
+				labels := shrimpfilter.ExtractLabels(s)
+				if !m.MatchLabels(labels) {
+					return nil
+				}
+			}
+			return fn(shrimptypes.Entry{Timestamp: ts, Data: s})
 		})
 	})
 }

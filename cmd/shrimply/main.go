@@ -107,7 +107,9 @@ func main() {
 	fromStr := flag.String("from", "", "query starting timestamp (duration e.g. 5m, or Unix nanoseconds)")
 	toStr := flag.String("to", "", "query ending timestamp (duration e.g. 1m, or Unix nanoseconds)")
 	termFlag := flag.String("term", "", "filter term (can also be specified as positional arguments)")
+	qFlag := flag.String("q", "", "matcher filter (JSON, same format as GET /query q param)")
 	parseFlag := flag.Bool("parse", false, "enables entry parsing")
+	statsFlag := flag.Bool("stats", false, "prints query execution stats to stderr")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: shrimply [options] [term]\n")
@@ -154,6 +156,9 @@ func main() {
 	if term != "" {
 		q.Set("term", term)
 	}
+	if *qFlag != "" {
+		q.Set("q", *qFlag)
+	}
 	if from != 0 {
 		q.Set("from", strconv.FormatInt(from, 10))
 	}
@@ -192,5 +197,23 @@ func main() {
 			s = formatEntry(entry)
 		}
 		fmt.Println(s)
+	}
+
+	if *statsFlag && block.Stats != nil {
+		stats := block.Stats
+		fmt.Fprintf(os.Stderr, "stats: took=%dms parts(total=%d pruned_ts=%d pruned_index=%d scanned=%d) blocks(total=%d pruned_ts=%d pruned_index=%d scanned=%d) entries(scanned=%d matched=%d) used_index=%t\n",
+			stats.DurationMs,
+			stats.PartsTotal,
+			stats.PartsPrunedByTS,
+			stats.PartsPrunedByIndex,
+			stats.PartsScanned,
+			stats.BlocksTotal,
+			stats.BlocksPrunedByTS,
+			stats.BlocksPrunedByIndex,
+			stats.BlocksScanned,
+			stats.EntriesScanned,
+			stats.EntriesMatched,
+			stats.UsedIndex,
+		)
 	}
 }
