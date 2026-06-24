@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -676,7 +677,13 @@ func (s *Server) handlePart(w http.ResponseWriter, r *http.Request) {
 	// (safe because os.Open failure occurs before any bytes are written to w).
 	w.Header().Set("Content-Type", "application/json")
 	if err := s.lsm.ServeLocalPart(r, w); err != nil {
-		http.Error(w, "part not found: "+r.PathValue("id"), http.StatusNotFound)
+		status := http.StatusInternalServerError
+		msg := "failed to serve part: " + r.PathValue("id")
+		if os.IsNotExist(err) {
+			status = http.StatusNotFound
+			msg = "part not found: " + r.PathValue("id")
+		}
+		http.Error(w, msg, status)
 	}
 }
 

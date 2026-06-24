@@ -312,6 +312,16 @@ func ReadRowBlock(pf *PartFileV2, idx int) (*shrimptypes.RowBlock, error) {
 	}, nil
 }
 
+// VerifyPartV2 fully decodes every block in the part.
+func VerifyPartV2(pf *PartFileV2) error {
+	for i := range pf.Headers {
+		if _, err := ReadRowBlock(pf, i); err != nil {
+			return fmt.Errorf("verify block %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // StreamRowBlock decompresses block idx and calls fn for each entry that passes
 // the timestamp range and term filter. No RowBlock is built and no result slice
 // is accumulated: only one string is allocated per matching entry via

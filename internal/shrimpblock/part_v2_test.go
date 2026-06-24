@@ -1,6 +1,7 @@
 package shrimpblock
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -101,4 +102,26 @@ func TestStreamRowBlockMatcher_EmptyMatchesAll(t *testing.T) {
 		return nil
 	}))
 	require.Equal(t, 2, got)
+}
+
+func TestVerifyPartV2RejectsCorruptBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "p4.json")
+	entries := []shrimptypes.Entry{{Timestamp: 1, Data: "x"}, {Timestamp: 2, Data: "y"}}
+	_, err := WritePartV2(path, entries)
+	require.NoError(t, err)
+
+	pf, err := OpenPartV2(path, shrimptypes.PartMeta{FormatVersion: 1})
+	require.NoError(t, err)
+	defer pf.Close()
+
+	require.NoError(t, VerifyPartV2(pf))
+
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{0x00}, pf.Headers[0].Offset)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	require.Error(t, VerifyPartV2(pf))
 }

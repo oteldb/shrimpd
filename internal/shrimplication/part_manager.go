@@ -46,6 +46,10 @@ func (pm *PartManager) Get(id string, meta shrimptypes.PartMeta) (*shrimpblock.P
 	if pf == nil {
 		return nil, nil
 	}
+	if err := shrimpblock.VerifyPartV2(pf); err != nil {
+		_ = pf.Close()
+		return nil, err
+	}
 
 	pm.mu.Lock()
 	if existing, ok := pm.fds[id]; ok {
