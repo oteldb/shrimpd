@@ -37,12 +37,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	httpprof "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"runtime/pprof"
+	runtimepprof "runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -89,12 +90,12 @@ func main() {
 			slog.Error("create cpu profile", "error", err)
 			os.Exit(1)
 		}
-		if err := pprof.StartCPUProfile(f); err != nil {
+		if err := runtimepprof.StartCPUProfile(f); err != nil {
 			slog.Error("start cpu profile", "error", err)
 			os.Exit(1)
 		}
 		defer func() {
-			pprof.StopCPUProfile()
+			runtimepprof.StopCPUProfile()
 			_ = f.Close()
 		}()
 	}
@@ -161,8 +162,14 @@ func main() {
 	// pprof HTTP server (separate from the main API server).
 	if *pprofAddr != "" {
 		go func() {
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /debug/pprof/", httpprof.Index)
+			mux.HandleFunc("GET /debug/pprof/cmdline", httpprof.Cmdline)
+			mux.HandleFunc("GET /debug/pprof/profile", httpprof.Profile)
+			mux.HandleFunc("GET /debug/pprof/symbol", httpprof.Symbol)
+			mux.HandleFunc("GET /debug/pprof/trace", httpprof.Trace)
 			slog.Info("pprof listening", "addr", *pprofAddr)
-			if err := http.ListenAndServe(*pprofAddr, nil); err != nil { // #nosec G114
+			if err := http.ListenAndServe(*pprofAddr, mux); err != nil { // #nosec G114
 				slog.Error("pprof server", "error", err)
 			}
 		}()
@@ -212,7 +219,7 @@ func heapMonitor(ctx context.Context, dir string, threshold int64, interval time
 			return
 		}
 		runtime.GC() // get up-to-date stats
-		if err := pprof.WriteHeapProfile(f); err != nil {
+		if err := runtimepprof.WriteHeapProfile(f); err != nil {
 			slog.Error("write heap profile", "error", err)
 		} else {
 			var ms runtime.MemStats
