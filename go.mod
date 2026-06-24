@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/CAFxX/httpcompression v0.0.9
 	github.com/ClickHouse/ch-go v0.72.0
+	github.com/blevesearch/vellum v1.2.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/go-faster/jx v1.2.0
 	github.com/klauspost/compress v1.18.6
@@ -27,6 +28,8 @@ require (
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/andybalholm/brotli v1.0.5 // indirect
+	github.com/bits-and-blooms/bitset v1.24.2 // indirect
+	github.com/blevesearch/mmap-go v1.2.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -112,5 +115,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )
-
-replace github.com/docker/go-connections => github.com/docker/go-connections v0.5.0

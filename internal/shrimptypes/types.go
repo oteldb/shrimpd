@@ -65,6 +65,7 @@ type QueryStats struct {
 	BlocksTotal         int `json:"blocks_total"`
 	BlocksPrunedByTS    int `json:"blocks_pruned_by_ts"`
 	BlocksPrunedByIndex int `json:"blocks_pruned_by_index"`
+	BlocksPrunedByBloom int `json:"blocks_pruned_by_bloom"`
 	BlocksScanned       int `json:"blocks_scanned"`
 
 	EntriesScanned int `json:"entries_scanned"`

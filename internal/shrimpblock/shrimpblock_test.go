@@ -1,13 +1,29 @@
 package shrimpblock
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/blevesearch/vellum"
 	"github.com/stretchr/testify/require"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 )
+
+func openFSTForTest(t *testing.T, path string, start, end []byte) (*vellum.FSTIterator, error) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	f, err := vellum.Load(data)
+	if err != nil {
+		return nil, err
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f.Iterator(start, end)
+}
 
 func TestWriteBlockZstdRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -58,33 +74,35 @@ func TestReadLocalPartLegacyPlain(t *testing.T) {
 	require.Equal(t, []shrimptypes.Entry{{Timestamp: 1, Data: "foo"}}, got.Data)
 }
 
-func TestWriteIndexBlockZstdRoundTrip(t *testing.T) {
+func TestBuildIndexFSTRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "index"), 0o750))
-	block := shrimptypes.IndexBlock{Entries: []shrimptypes.IndexEntry{
+	entries := []shrimptypes.IndexEntry{
 		{Token: "hello", DataID: "p1"},
+		{Token: "hello", DataID: "p2"},
 		{Token: "world", DataID: "p1"},
-	}}
-	path := filepath.Join(dir, "index", "test.json")
-	require.NoError(t, WriteIndexBlock(path, block, CompressionZstd))
+	}
+	path := filepath.Join(dir, "index", "test.fst")
+	require.NoError(t, BuildIndexFST(path, entries))
 
-	data, err := os.ReadFile(path)
+	// prefix scan: all DataIDs for token "hello"
+	start := compositeKey("hello", "")
+	end := []byte("hello\x01")
+	itr, err := openFSTForTest(t, path, start, end)
 	require.NoError(t, err)
-	require.Equal(t, []byte{0x28, 0xb5, 0x2f, 0xfd}, data[:4], "zstd frame magic on disk")
-
-	got, err := ReadIndexBlock(path)
-	require.NoError(t, err)
-	require.Equal(t, block, got)
-}
-
-func TestReadIndexBlockLegacyPlain(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "index"), 0o750))
-	plain := []byte(`{"entries":[{"token":"hello","data_id":"p1"}]}`)
-	path := filepath.Join(dir, "index", "legacy.json")
-	require.NoError(t, os.WriteFile(path, plain, 0o644))
-
-	got, err := ReadIndexBlock(path)
-	require.NoError(t, err)
-	require.Equal(t, shrimptypes.IndexBlock{Entries: []shrimptypes.IndexEntry{{Token: "hello", DataID: "p1"}}}, got)
+	var got []string
+	for {
+		k, _ := itr.Current()
+		if k == nil {
+			break
+		}
+		sep := bytes.IndexByte(k, '\x00')
+		require.True(t, sep >= 0)
+		got = append(got, string(k[sep+1:]))
+		if err := itr.Next(); err != nil {
+			break
+		}
+	}
+	_ = itr.Close()
+	require.Equal(t, []string{"p1", "p2"}, got)
 }

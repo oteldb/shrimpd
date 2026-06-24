@@ -1,9 +1,11 @@
 package shrimplication
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/maypok86/otter"
-	"github.com/tdakkota/shrimpd/internal/fsyncutil"
+	"github.com/blevesearch/vellum"
+
 	"github.com/tdakkota/shrimpd/internal/shrimpblock"
 	"github.com/tdakkota/shrimpd/internal/shrimptypes"
 	"github.com/tdakkota/shrimpd/internal/shrimpwal"
@@ -21,7 +23,8 @@ import (
 
 const indexFlushThreshold = 1000
 
-// IndexEngine is a local-only index table for fast text-token lookup.
+// IndexEngine is a local-only index table for fast text-token and label lookup.
+// Index data is stored as vellum FST files with composite keys (token+"\x00"+dataID).
 type IndexEngine struct {
 	nodeID  string
 	dataDir string
@@ -31,20 +34,18 @@ type IndexEngine struct {
 	// exactly equal the flushed snapshot. Held only across that brief boundary,
 	// never across the heavy index-block write.
 	writeMu sync.Mutex
-	mem     *IndexMemTable      // own internal lock; see writeMu/mu for cross-field invariants
-	wal     *shrimpwal.IndexWAL // own internal lock; see writeMu
+	mem     *IndexMemTable
+	wal     *shrimpwal.IndexWAL
 
-	flushSig chan struct{} // buffered(1): signals the Run loop to flush
+	flushSig chan struct{}
 
-	// mu guards parts and covered, and is also held for the whole duration of a
+	// mu guards parts, covered, and fstCache. Held for the whole duration of a
 	// Flush so Lookup never observes the memtable drained before the new part is
-	// published (which would falsely prune). Because it is held across the entire
-	// flush, it also serializes flushes against each other.
-	mu      sync.RWMutex
-	parts   []shrimptypes.IndexPartMeta
-	covered map[string]struct{}
-
-	idxBlockCache otter.Cache[string, shrimptypes.IndexBlock] // keyed by absolute path; own internal lock
+	// published (which would falsely prune). Also serializes flushes.
+	mu       sync.RWMutex
+	parts    []shrimptypes.IndexPartMeta
+	covered  map[string]struct{}
+	fstCache map[string]*vellum.FST // keyed by fstPath(id); closed on eviction
 }
 
 // NewIndexEngine initializes the IndexEngine, recovers WAL, and loads metadata.
@@ -58,26 +59,16 @@ func NewIndexEngine(nodeID, dataDir string) (*IndexEngine, error) {
 	if err != nil {
 		return nil, err
 	}
-	idxBlockCache, _ := otter.MustBuilder[string, shrimptypes.IndexBlock](64 << 20).
-		Cost(func(_ string, b shrimptypes.IndexBlock) uint32 {
-			n := 0
-			for _, e := range b.Entries {
-				n += len(e.Token) + len(e.DataID)
-			}
-			return uint32(n)
-		}).
-		Build()
 
 	engine := &IndexEngine{
-		nodeID:        nodeID,
-		dataDir:       dataDir,
-		mem:           &IndexMemTable{},
-		wal:           wal,
-		flushSig:      make(chan struct{}, 1),
-		idxBlockCache: idxBlockCache,
+		nodeID:   nodeID,
+		dataDir:  dataDir,
+		mem:      &IndexMemTable{},
+		wal:      wal,
+		flushSig: make(chan struct{}, 1),
+		fstCache: make(map[string]*vellum.FST),
 	}
 
-	// Recover unflushed index entries from WAL
 	entries, err := wal.Recover()
 	if err != nil {
 		_ = wal.Close()
@@ -87,19 +78,39 @@ func NewIndexEngine(nodeID, dataDir string) (*IndexEngine, error) {
 		engine.mem.Write(entries)
 	}
 
-	// Load local index part metadata
 	if err := engine.loadParts(); err != nil {
 		_ = wal.Close()
 		return nil, fmt.Errorf("load index parts: %w", err)
 	}
 
-	// Load covered parts
 	if err := engine.loadCovered(); err != nil {
 		_ = wal.Close()
 		return nil, fmt.Errorf("load covered: %w", err)
 	}
 
 	return engine, nil
+}
+
+func (e *IndexEngine) fstPath(id string) string {
+	return filepath.Join(e.dataDir, "index", id+".fst")
+}
+
+// openFST opens (or returns cached) the mmap'd FST for the given index part ID.
+// Must be called with mu held (at least read).
+func (e *IndexEngine) openFST(id string) (*vellum.FST, error) {
+	path := e.fstPath(id)
+	if f, ok := e.fstCache[path]; ok {
+		return f, nil
+	}
+	f, err := vellum.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // old-format part; treat as not covered
+		}
+		return nil, fmt.Errorf("open fst %s: %w", path, err)
+	}
+	e.fstCache[path] = f
+	return f, nil
 }
 
 func (e *IndexEngine) loadParts() error {
@@ -185,7 +196,7 @@ func (e *IndexEngine) saveCovered() error {
 	if err := os.Rename(name, path); err != nil {
 		return err
 	}
-	return fsyncutil.SyncDir(filepath.Dir(path))
+	return nil
 }
 
 // MarkCovered marks data part IDs as covered by the index and persists the list.
@@ -198,8 +209,7 @@ func (e *IndexEngine) MarkCovered(dataIDs []string) error {
 	return e.saveCovered()
 }
 
-// Write appends entries to the index WAL and writes to memtable. The fsync wait
-// happens after releasing writeMu (group commit); see LSM.Write for the rationale.
+// Write appends entries to the index WAL and writes to memtable.
 func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -222,17 +232,10 @@ func (e *IndexEngine) Write(entries []shrimptypes.IndexEntry) error {
 	return nil
 }
 
-// Flush sorts/deduplicates the index memtable and writes an immutable index part.
-//
-// Lock order is mu → writeMu. mu is held for the whole flush: it both serializes
-// flushes against each other and prevents a concurrent Lookup from observing the
-// memtable drained before the new part is published (which would falsely prune).
-// writeMu is held only across the brief "snapshot memtable + seal WAL" boundary,
-// then released so concurrent Write is not blocked on the heavy index-block write.
+// Flush sorts/deduplicates the index memtable and writes an immutable FST index part.
 func (e *IndexEngine) Flush(ctx context.Context) error {
 	e.mu.Lock()
 
-	// Brief boundary: snapshot the memtable and seal the WAL atomically vs Write.
 	e.writeMu.Lock()
 	var entries []shrimptypes.IndexEntry
 	e.mem.SnapshotView(func(snapshot []shrimptypes.IndexEntry) {
@@ -245,9 +248,9 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 		return nil
 	}
 	sealedSeq, sealErr := e.wal.Seal()
-	e.writeMu.Unlock() // Write may now append to the fresh active segment + memtable.
+	e.writeMu.Unlock()
 	if sealErr != nil {
-		e.mem.Write(entries) // nothing sealed cleanly; put entries back for a retry
+		e.mem.Write(entries)
 		e.mu.Unlock()
 		return fmt.Errorf("seal index wal: %w", sealErr)
 	}
@@ -264,31 +267,27 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 
 	id := fmt.Sprintf("%d-%s", time.Now().UnixNano(), e.nodeID)
 	indexDir := filepath.Join(e.dataDir, "index")
-	path := filepath.Join(indexDir, id+".json")
+	fstPath := filepath.Join(indexDir, id+".fst")
 	metaPath := filepath.Join(indexDir, id+".meta")
-	compression := shrimpblock.CompressionZstd
 
-	// On any failure, restore the entries to the memtable and keep the sealed WAL
-	// segment as their durable copy (a later flush discards it).
-	if err := shrimpblock.WriteIndexBlock(path, shrimptypes.IndexBlock{Entries: entries}, compression); err != nil {
+	if err := shrimpblock.BuildIndexFST(fstPath, entries); err != nil {
 		e.mem.Write(entries)
 		e.mu.Unlock()
-		return fmt.Errorf("write index block: %w", err)
+		return fmt.Errorf("write index fst: %w", err)
 	}
 
 	meta := shrimptypes.IndexPartMeta{
-		ID:          id,
-		NodeID:      e.nodeID,
-		Level:       0,
-		MinToken:    entries[0].Token,
-		MaxToken:    entries[len(entries)-1].Token,
-		Count:       len(entries),
-		CreatedAt:   time.Now().UnixNano(),
-		Compression: compression,
+		ID:        id,
+		NodeID:    e.nodeID,
+		Level:     0,
+		MinToken:  entries[0].Token,
+		MaxToken:  entries[len(entries)-1].Token,
+		Count:     len(entries),
+		CreatedAt: time.Now().UnixNano(),
 	}
 
 	if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
-		_ = os.Remove(path)
+		_ = os.Remove(fstPath)
 		e.mem.Write(entries)
 		e.mu.Unlock()
 		return fmt.Errorf("write index meta: %w", err)
@@ -297,8 +296,6 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	e.parts = append(e.parts, meta)
 	e.mu.Unlock()
 
-	// Entries are now durable in the index part: the sealed WAL segments are
-	// redundant and can be deleted.
 	if err := e.wal.Discard(sealedSeq); err != nil {
 		slog.WarnContext(ctx, "index wal discard failed", "error", err)
 	}
@@ -307,7 +304,84 @@ func (e *IndexEngine) Flush(ctx context.Context) error {
 	return nil
 }
 
-// Compact merges L0 index parts into a higher-level part and drops stale DataIDs.
+// filteringIterator wraps an FSTIterator and skips composite keys whose DataID
+// is not in the active set. Implements vellum.Iterator for use with vellum.Merge.
+type filteringIterator struct {
+	inner  *vellum.FSTIterator
+	active map[string]struct{}
+	currK  []byte
+	currV  uint64
+}
+
+func newFilteringIterator(inner *vellum.FSTIterator, active map[string]struct{}) *filteringIterator {
+	fi := &filteringIterator{inner: inner, active: active}
+	fi.advance()
+	return fi
+}
+
+func (fi *filteringIterator) advance() {
+	for {
+		k, v := fi.inner.Current()
+		if k == nil {
+			fi.currK = nil
+			return
+		}
+		sep := bytes.IndexByte(k, '\x00')
+		if sep >= 0 {
+			if _, ok := fi.active[string(k[sep+1:])]; ok {
+				fi.currK = append(fi.currK[:0], k...)
+				fi.currV = v
+				return
+			}
+		}
+		if err := fi.inner.Next(); err != nil {
+			fi.currK = nil
+			return
+		}
+	}
+}
+
+func (fi *filteringIterator) Current() ([]byte, uint64) {
+	return fi.currK, fi.currV
+}
+
+func (fi *filteringIterator) Next() error {
+	if fi.currK == nil {
+		return vellum.ErrIteratorDone
+	}
+	if err := fi.inner.Next(); err != nil {
+		fi.currK = nil
+		return err
+	}
+	fi.advance()
+	if fi.currK == nil {
+		return vellum.ErrIteratorDone
+	}
+	return nil
+}
+
+func (fi *filteringIterator) Seek(key []byte) error {
+	if err := fi.inner.Seek(key); err != nil {
+		fi.currK = nil
+		return err
+	}
+	fi.advance()
+	if fi.currK == nil {
+		return vellum.ErrIteratorDone
+	}
+	return nil
+}
+
+func (fi *filteringIterator) Reset(_ *vellum.FST, _, _ []byte, _ vellum.Automaton) error {
+	return errors.New("filteringIterator: Reset not supported")
+}
+
+func (fi *filteringIterator) Close() error {
+	return fi.inner.Close()
+}
+
+// Compact merges L0 index parts into a higher-level part using vellum.Merge,
+// filtering out stale DataIDs in a streaming fashion.
 func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]struct{}) error {
 	e.mu.Lock()
 	var l0 []shrimptypes.IndexPartMeta
@@ -322,32 +396,39 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		return nil
 	}
 
-	var merged []shrimptypes.IndexEntry
+	// Open FSTs and create filtering iterators (streaming — O(1) memory per part).
+	itrs := make([]vellum.Iterator, 0, len(l0))
+	fsts := make([]*vellum.FST, 0, len(l0))
 	for _, meta := range l0 {
-		blockPath := filepath.Join(e.dataDir, "index", meta.ID+".json")
-		block, err := shrimpblock.ReadIndexBlock(blockPath)
+		e.mu.Lock()
+		f, err := e.openFST(meta.ID)
+		e.mu.Unlock()
 		if err != nil {
-			return fmt.Errorf("read index part %s: %w", meta.ID, err)
+			for _, itr := range itrs {
+				_ = itr.Close()
+			}
+			return fmt.Errorf("open fst for compact %s: %w", meta.ID, err)
 		}
-		merged = append(merged, block.Entries...)
+		if f == nil {
+			// Old-format part without FST; skip it.
+			continue
+		}
+		inner, err := f.Iterator(nil, nil)
+		if err != nil && !errors.Is(err, vellum.ErrIteratorDone) {
+			for _, itr := range itrs {
+				_ = itr.Close()
+			}
+			return fmt.Errorf("fst iterator for compact %s: %w", meta.ID, err)
+		}
+		if err == nil {
+			itrs = append(itrs, newFilteringIterator(inner, activeDataIDs))
+			fsts = append(fsts, f)
+		}
 	}
 
-	var active []shrimptypes.IndexEntry
-	for _, entry := range merged {
-		if _, ok := activeDataIDs[entry.DataID]; ok {
-			active = append(active, entry)
-		}
+	if len(itrs) == 0 {
+		return nil
 	}
-
-	slices.SortFunc(active, func(a, b shrimptypes.IndexEntry) int {
-		if c := cmp.Compare(a.Token, b.Token); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.DataID, b.DataID)
-	})
-	active = slices.CompactFunc(active, func(a, b shrimptypes.IndexEntry) bool {
-		return a.Token == b.Token && a.DataID == b.DataID
-	})
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -356,7 +437,6 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 	for _, p := range l0 {
 		oldSet[p.ID] = true
 	}
-
 	var next []shrimptypes.IndexPartMeta
 	for _, p := range e.parts {
 		if !oldSet[p.ID] {
@@ -364,48 +444,80 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		}
 	}
 
-	compression := shrimpblock.CompressionZstd
-	if len(active) > 0 {
-		id := fmt.Sprintf("%d-%s-compact", time.Now().UnixNano(), e.nodeID)
-		indexDir := filepath.Join(e.dataDir, "index")
-		path := filepath.Join(indexDir, id+".json")
-		metaPath := filepath.Join(indexDir, id+".meta")
+	id := fmt.Sprintf("%d-%s-compact", time.Now().UnixNano(), e.nodeID)
+	indexDir := filepath.Join(e.dataDir, "index")
+	fstPath := filepath.Join(indexDir, id+".fst")
+	metaPath := filepath.Join(indexDir, id+".meta")
 
-		if err := shrimpblock.WriteIndexBlock(path, shrimptypes.IndexBlock{Entries: active}, compression); err != nil {
-			return fmt.Errorf("write compacted index block: %w", err)
+	tmp, err := os.CreateTemp(indexDir, ".tmp-compact-fst-")
+	if err != nil {
+		for _, itr := range itrs {
+			_ = itr.Close()
 		}
+		return fmt.Errorf("create compact temp: %w", err)
+	}
+	tmpName := tmp.Name()
 
-		meta := shrimptypes.IndexPartMeta{
-			ID:          id,
-			NodeID:      e.nodeID,
-			Level:       1,
-			MinToken:    active[0].Token,
-			MaxToken:    active[len(active)-1].Token,
-			Count:       len(active),
-			CreatedAt:   time.Now().UnixNano(),
-			Compression: compression,
-		}
-
-		if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
-			_ = os.Remove(path)
-			return fmt.Errorf("write compacted index meta: %w", err)
-		}
-
-		next = append(next, meta)
-		slog.InfoContext(ctx, "compacted index parts", "old_count", len(l0), "new_id", id, "count", meta.Count)
+	mergeErr := vellum.Merge(tmp, nil, itrs, vellum.MergeMin)
+	_ = tmp.Sync()
+	_ = tmp.Close()
+	for _, itr := range itrs {
+		_ = itr.Close()
 	}
 
+	if mergeErr != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("vellum merge: %w", mergeErr)
+	}
+
+	// Determine MinToken/MaxToken by opening the merged FST briefly.
+	var minToken, maxToken string
+	{
+		merged, err := vellum.Open(tmpName)
+		if err == nil {
+			if k, err2 := merged.GetMinKey(); err2 == nil && len(k) > 0 {
+				minToken = string(k)
+			}
+			if k, err2 := merged.GetMaxKey(); err2 == nil && len(k) > 0 {
+				maxToken = string(k)
+			}
+			_ = merged.Close()
+		}
+	}
+
+	if err := os.Rename(tmpName, fstPath); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("rename compact fst: %w", err)
+	}
+
+	meta := shrimptypes.IndexPartMeta{
+		ID:        id,
+		NodeID:    e.nodeID,
+		Level:     1,
+		MinToken:  minToken,
+		MaxToken:  maxToken,
+		CreatedAt: time.Now().UnixNano(),
+	}
+	if err := shrimpblock.WriteIndexMeta(metaPath, meta); err != nil {
+		_ = os.Remove(fstPath)
+		return fmt.Errorf("write compacted index meta: %w", err)
+	}
+
+	next = append(next, meta)
 	e.parts = next
 
-	// Clean up files and evict cache entries
+	// Evict old FSTs from cache and remove files.
 	for _, p := range l0 {
-		blockPath := filepath.Join(e.dataDir, "index", p.ID+".json")
-		e.idxBlockCache.Delete(blockPath)
-		_ = os.Remove(blockPath)
-		_ = os.Remove(filepath.Join(e.dataDir, "index", p.ID+".meta"))
+		path := e.fstPath(p.ID)
+		if f, ok := e.fstCache[path]; ok {
+			_ = f.Close()
+			delete(e.fstCache, path)
+		}
+		_ = os.Remove(path)
+		_ = os.Remove(filepath.Join(indexDir, p.ID+".meta"))
 	}
 
-	// Clean up covered map to only contain activeDataIDs
+	// Clean up covered map.
 	for id := range e.covered {
 		if _, ok := activeDataIDs[id]; !ok {
 			delete(e.covered, id)
@@ -415,10 +527,60 @@ func (e *IndexEngine) Compact(ctx context.Context, activeDataIDs map[string]stru
 		return fmt.Errorf("save covered: %w", err)
 	}
 
+	slog.InfoContext(ctx, "compacted index parts", "old_count", len(l0), "new_id", id)
+	_ = fsts // fsts opened via fstCache, closed above
 	return nil
 }
 
-// Lookup queries the index for matching data part IDs.
+// lookupToken scans all index parts for a single composite-key prefix
+// (token+"\x00") and collects DataIDs into matches. Must be called with mu RLock held.
+func (e *IndexEngine) lookupToken(ctx context.Context, tok string, matches map[string]struct{}) error {
+	start := []byte(tok + "\x00")
+	end := []byte(tok + "\x01")
+
+	e.mem.Lookup(tok, func(dataID string) {
+		matches[dataID] = struct{}{}
+	})
+
+	for _, part := range e.parts {
+		if tok < part.MinToken || tok > part.MaxToken {
+			continue
+		}
+		f, err := e.openFST(part.ID)
+		if err != nil {
+			slog.WarnContext(ctx, "failed to open index fst", "id", part.ID, "error", err)
+			continue
+		}
+		if f == nil {
+			continue
+		}
+		itr, err := f.Iterator(start, end)
+		if err != nil {
+			if errors.Is(err, vellum.ErrIteratorDone) {
+				continue
+			}
+			slog.WarnContext(ctx, "fst iterator error", "id", part.ID, "error", err)
+			continue
+		}
+		for {
+			k, _ := itr.Current()
+			if k == nil {
+				break
+			}
+			sep := bytes.IndexByte(k, '\x00')
+			if sep >= 0 {
+				matches[string(k[sep+1:])] = struct{}{}
+			}
+			if err := itr.Next(); err != nil {
+				break
+			}
+		}
+		_ = itr.Close()
+	}
+	return nil
+}
+
+// Lookup queries the index for matching data part IDs by term (text tokens).
 func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []shrimptypes.PartMeta) (matchedIDs map[string]struct{}, complete bool, err error) {
 	if term == "" {
 		return nil, false, nil
@@ -448,51 +610,57 @@ func (e *IndexEngine) Lookup(ctx context.Context, term string, candidates []shri
 	var finalMatches map[string]struct{}
 	for i, tok := range tokens {
 		matches := make(map[string]struct{})
-
-		e.mem.Lookup(tok, func(dataID string) {
-			matches[dataID] = struct{}{}
-		})
-
-		for _, part := range e.parts {
-			if tok < part.MinToken || tok > part.MaxToken {
-				continue
-			}
-
-			blockPath := filepath.Join(e.dataDir, "index", part.ID+".json")
-			block, ok := e.idxBlockCache.Get(blockPath)
-			if !ok {
-				var err error
-				block, err = shrimpblock.ReadIndexBlock(blockPath)
-				if err != nil {
-					slog.WarnContext(ctx, "failed to read index block", "path", blockPath, "error", err)
-					return nil, false, err
-				}
-				e.idxBlockCache.Set(blockPath, block)
-			}
-
-			idx, found := slices.BinarySearchFunc(block.Entries, tok, func(entry shrimptypes.IndexEntry, target string) int {
-				return cmp.Compare(entry.Token, target)
-			})
-			if found {
-				for j := idx; j >= 0 && block.Entries[j].Token == tok; j-- {
-					matches[block.Entries[j].DataID] = struct{}{}
-				}
-				for j := idx + 1; j < len(block.Entries) && block.Entries[j].Token == tok; j++ {
-					matches[block.Entries[j].DataID] = struct{}{}
-				}
-			}
+		if err := e.lookupToken(ctx, tok, matches); err != nil {
+			return nil, false, err
 		}
-
 		if i == 0 {
 			finalMatches = matches
 		} else {
-			intersected := make(map[string]struct{})
-			for id := range matches {
-				if _, ok := finalMatches[id]; ok {
-					intersected[id] = struct{}{}
+			for id := range finalMatches {
+				if _, ok := matches[id]; !ok {
+					delete(finalMatches, id)
 				}
 			}
-			finalMatches = intersected
+		}
+	}
+
+	return finalMatches, true, nil
+}
+
+// LookupTokens queries the index for matching data part IDs by pre-built tokens
+// (e.g. label tokens like "lbl:service_name=svc-a"). Used by QueryMatcherWithStats.
+func (e *IndexEngine) LookupTokens(ctx context.Context, tokens []string, candidates []shrimptypes.PartMeta) (map[string]struct{}, bool, error) {
+	if len(tokens) == 0 {
+		return nil, false, nil
+	}
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if len(e.parts) == 0 && len(e.covered) == 0 {
+		return nil, false, nil
+	}
+
+	for _, pm := range candidates {
+		if _, ok := e.covered[pm.ID]; !ok {
+			return nil, false, nil
+		}
+	}
+
+	var finalMatches map[string]struct{}
+	for i, tok := range tokens {
+		matches := make(map[string]struct{})
+		if err := e.lookupToken(ctx, tok, matches); err != nil {
+			return nil, false, err
+		}
+		if i == 0 {
+			finalMatches = matches
+		} else {
+			for id := range finalMatches {
+				if _, ok := matches[id]; !ok {
+					delete(finalMatches, id)
+				}
+			}
 		}
 	}
 
@@ -508,10 +676,15 @@ func (e *IndexEngine) ReindexPart(_ context.Context, meta shrimptypes.PartMeta, 
 	return e.MarkCovered([]string{meta.ID})
 }
 
-// Close flushes memory and closes WAL.
+// Close flushes memory and closes WAL and all cached FSTs.
 func (e *IndexEngine) Close() error {
 	if e.mem.Len() > 0 {
 		_ = e.Flush(context.Background())
 	}
+	e.mu.Lock()
+	for _, f := range e.fstCache {
+		_ = f.Close()
+	}
+	e.mu.Unlock()
 	return e.wal.Close()
 }

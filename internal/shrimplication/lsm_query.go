@@ -90,7 +90,7 @@ func (l *LSM) QueryWithStats(ctx context.Context, from, to int64, term string) (
 				continue
 			}
 			if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
-				stats.BlocksPrunedByIndex++
+				stats.BlocksPrunedByBloom++
 				continue
 			}
 			stats.BlocksScanned++
@@ -210,7 +210,7 @@ func (l *LSM) QueryStreamWithStats(ctx context.Context, from, to int64, term str
 				continue
 			}
 			if normalizedTerm != "" && !shrimpblock.BloomMightContain(&hdr.Bloom, normalizedTerm) {
-				stats.BlocksPrunedByIndex++
+				stats.BlocksPrunedByBloom++
 				continue
 			}
 			stats.BlocksScanned++
@@ -286,9 +286,56 @@ func (l *LSM) QueryMatcherWithStats(ctx context.Context, from, to int64, m shrim
 		}
 	}
 
+	// Build label tokens for OpLabelEq filters and look them up in the FST index.
+	var (
+		useLabelIndex   bool
+		labelIndexedIDs map[string]struct{}
+	)
+	if len(m.Labels) > 0 {
+		var labelTokens []string
+		for _, lf := range m.Labels {
+			if lf.Op == shrimpfilter.OpLabelEq {
+				labelTokens = append(labelTokens, shrimpblock.LabelTokenPrefix+lf.Label+"="+lf.Value)
+			}
+		}
+		if len(labelTokens) > 0 {
+			ids, complete, err := l.idxEngine.LookupTokens(ctx, labelTokens, timeParts)
+			if err != nil {
+				slog.WarnContext(ctx, "label index lookup failed", "error", err)
+			} else if complete {
+				useLabelIndex = true
+				labelIndexedIDs = ids
+				stats.UsedIndex = true
+			}
+		}
+	}
+
 	for _, meta := range timeParts {
 		if ctx.Err() != nil {
 			return stats, ctx.Err()
+		}
+		// Fast token-set pre-filter (no I/O): check label name+value appear as tokens.
+		if len(m.Labels) > 0 {
+			pruned := false
+			for _, lf := range m.Labels {
+				if lf.Op == shrimpfilter.OpLabelEq && !shrimpblock.HasToken(meta.Tokens, lf.Label+"="+lf.Value) {
+					pruned = true
+					break
+				}
+			}
+			if pruned {
+				stats.PartsPrunedByIndex++
+				stats.BlocksPrunedByIndex += meta.BlockCount
+				continue
+			}
+		}
+		// FST index lookup: prune parts not matched by the label index.
+		if useLabelIndex {
+			if _, ok := labelIndexedIDs[meta.ID]; !ok {
+				stats.PartsPrunedByIndex++
+				stats.BlocksPrunedByIndex += meta.BlockCount
+				continue
+			}
 		}
 		stats.PartsScanned++
 
@@ -313,7 +360,7 @@ func (l *LSM) QueryMatcherWithStats(ctx context.Context, from, to int64, m shrim
 					}
 				}
 				if pruned {
-					stats.BlocksPrunedByIndex++
+					stats.BlocksPrunedByBloom++
 					continue
 				}
 			}
