@@ -8,12 +8,15 @@
 - Key internal packages: `shrimplication` (LSM engine), `shrimpblock` (part/block storage), `shrimpwal` (WAL), `shrimpapi` (HTTP handlers), `shrimpfilter` (label/line filters), `shrimptypes` (shared types).
 
 ## Commands
+- `go build ./cmd/...` builds all three binaries.
 - `make test` runs `./go.test.sh`: normal tests, `-tags purego`, then `-race`, each with `--timeout 5m`.
 - `make test_fast` runs only `go test -short ./...` (skips slow/integration tests).
 - `make coverage` runs `go test -race -v -coverpkg=./... -coverprofile=profile.out ./...` then `go tool cover -func profile.out`.
 - `make tidy` runs `go mod tidy`.
 - Focused package check: `go test ./...` is the smallest repo-wide build check.
 - Lint: `golangci-lint run ./...`
+- Auto-fix lint issues: `golangci-lint run --fix ./...` (fixes many issues automatically; prefer this over manual edits).
+- Format: `golangci-lint fmt ./...`
 
 ## Local Run Notes
 - The CLI expects etcd at `localhost:2379` by default; example dependency: `docker run -p 2379:2379 -e ALLOW_NONE_AUTHENTICATION=yes bitnami/etcd:latest`.
@@ -23,7 +26,7 @@
 
 ## Lint And CI
 - CI uses reusable workflows from `go-faster/x` for test, cover, lint, commit checks, and CodeQL; dependency review runs on pull requests.
-- `.golangci.yml` enables `goimports` and `gofumpt`; its `goimports.local-prefixes` is currently `github.com/go-faster/gooners`, which does not match this module path.
+- `.golangci.yml` enables `goimports` and `gofumpt`.
 - The lint config uses `golangci-lint` v2 syntax and enables strict linters including `gosec`, `gocritic`, `modernize`, `revive`, and `staticcheck`; test files have several linter exclusions.
 
 ## Agent Workflow Notes

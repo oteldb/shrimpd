@@ -174,6 +174,10 @@ for each new LogEntry since pointer:
 Log gap detection: if the expected next index doesn't exist in etcd (e.g. after
 log truncation while offline), the node re-bootstraps from the parts snapshot.
 
+Failed remote part fetches are placed in a **pending retry queue** with
+exponential backoff (tracked in `lsm_replication.go`). Retries fire each
+replication tick alongside the normal log-apply loop.
+
 ### Log cleanup
 
 Every 30 s, the node that holds the minimum queue pointer among all active nodes
@@ -191,12 +195,47 @@ acts as cleanup coordinator: it deletes log entries with index < min-pointer
 
 ---
 
+## Query path
+
+Three entry points, all backed by `QueryWithStats` / `QueryStreamWithStats` /
+`QueryMatcherWithStats`:
+
+- `Query` / `QueryWithStats` — collects all matching entries into a `[]Entry`
+  slice, globally sorted by timestamp. Use for small result sets.
+- `QueryStream` / `QueryStreamWithStats` — streams results block-by-block
+  (O(one block) peak memory). Results arrive in part/block order, **not**
+  globally sorted. fn must not retain the `Entry` after returning.
+- `QueryMatcher` / `QueryMatcherWithStats` — like `QueryStream` but accepts a
+  `shrimpfilter.Matcher` (label + line filters) instead of a plain term.
+
+### Pruning hierarchy (applied in order)
+
+```
+1. Timestamp range       — PartMeta.Overlaps(from, to)
+2. Token presence        — shrimpblock.HasToken(meta.Tokens, term)   [text queries]
+   Label FST lookup      — IndexEngine.Lookup → LookupTokens          [label queries]
+3. Block bloom filter    — shrimpblock.BloomMightContain(&hdr.Bloom, term)
+4. Block timestamp range — hdr.MinTimestamp / hdr.MaxTimestamp
+```
+
+After pruning, blocks are decoded from disk (or served from `rowBlockCache`) and
+iterated via `RowBlock.Iterate` / `RowBlock.IterateMatcher`. The memtable
+(not-yet-flushed entries) is always included last.
+
+---
+
 ## Index engine (`index_engine.go`)
 
 A secondary LSM index mapping tokens → part IDs, stored under `dataDir` alongside
-data parts. Used for `TermSearch` queries to skip parts that don't contain a
-given token. Index parts are compacted in lockstep with data compaction; stale
-index entries (pointing to deleted data parts) are pruned by `Compact(activeIDs)`.
+data parts.
+
+- Storage format: **vellum FST** files (`.fst` + `.fst.meta`); keys are
+  composite `token + ordinal` bytes, values encode `dataID` ordinals.
+- Flush threshold: 1 000 in-memory index entries (`indexFlushThreshold`).
+- Used by `QueryMatcherWithStats` via `IndexEngine.Lookup` to narrow which parts
+  contain a given label token before opening any part file.
+- Index parts are compacted in lockstep with data compaction; stale entries
+  (pointing to deleted data parts) are pruned by `Compact(activeDataIDs)`.
 
 ---
 
