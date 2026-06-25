@@ -28,6 +28,10 @@ jobs:
   commit:
     uses: go-faster/x/.github/workflows/commit.yml@main
   codeql:
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
     uses: go-faster/x/.github/workflows/codeql.yml@main
     with:
       go: stable
