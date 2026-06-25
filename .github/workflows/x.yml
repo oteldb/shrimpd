@@ -16,11 +16,6 @@ jobs:
       enable-arm64: false
       # submodules: true
       go: stable
-  cover:
-    uses: go-faster/x/.github/workflows/cover.yml@main
-    with:
-      # submodules: true
-      go: stable
   lint:
     uses: go-faster/x/.github/workflows/lint.yml@main
     with:
