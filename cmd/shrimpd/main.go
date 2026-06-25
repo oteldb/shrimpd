@@ -222,16 +222,20 @@ func main() {
 }
 
 // heapMonitor polls heap stats and writes a heap profile when HeapInuse exceeds
-// threshold, and on SIGUSR1. Profiles land in dir as heap-<timestamp>.pprof.
-// A zero threshold disables the automatic dump; SIGUSR1 always works.
+// threshold. On platforms that support SIGUSR1, it also writes a profile on
+// manual signal. Profiles land in dir as heap-<timestamp>.pprof. A zero
+// threshold disables the automatic dump.
 func heapMonitor(ctx context.Context, dir string, threshold uint64, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// docker kill -s USR1 <container>  →  manual heap dump
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGUSR1)
-	defer signal.Stop(sigCh)
+	var sigCh <-chan os.Signal
+	if sig, _, ok := heapDumpSignal(); ok {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, sig)
+		defer signal.Stop(ch)
+		sigCh = ch
+	}
 
 	var lastDump time.Time
 	const minDumpInterval = 30 * time.Second
@@ -268,7 +272,8 @@ func heapMonitor(ctx context.Context, dir string, threshold uint64, interval tim
 		case <-ctx.Done():
 			return
 		case <-sigCh:
-			dump("SIGUSR1")
+			_, reason, _ := heapDumpSignal()
+			dump(reason)
 		case <-ticker.C:
 			if threshold <= 0 {
 				continue
