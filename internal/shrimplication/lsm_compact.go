@@ -1,6 +1,7 @@
 package shrimplication
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -76,6 +77,14 @@ func (l *LSM) compactLevel(ctx context.Context, level int, force bool) error {
 		}
 		return nil
 	}
+	// Sort by MinTimestamp so that the capped merge set always picks the
+	// temporally oldest (most cohesive) candidates.  Merging temporally
+	// adjacent parts keeps the resulting part's [MinTimestamp, MaxTimestamp]
+	// range as tight as possible, which maximizes time-range pruning during
+	// queries.
+	slices.SortFunc(levelParts, func(a, b shrimptypes.PartMeta) int {
+		return cmp.Compare(a.MinTimestamp, b.MinTimestamp)
+	})
 	// Cap the merge set to bound peak memory: compacting all parts at once can
 	// hold O(N × part_size) entries in memory simultaneously.
 	if len(levelParts) > compactTrigger {
