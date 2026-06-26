@@ -42,7 +42,7 @@ func (l *LSM) startup(ctx context.Context) error {
 		if err != nil {
 			slog.WarnContext(ctx, "bootstrap: peer unreachable, will retry", "id", id, "error", err)
 			l.mu.Lock()
-			l.pendingParts[id] = meta
+			l.pendingParts[id] = pendingEntry{meta: meta}
 			l.mu.Unlock()
 			continue
 		}
@@ -193,9 +193,10 @@ func (l *LSM) replicationLoop(ctx context.Context) error {
 					}
 
 					if err := l.applyLogEntry(ctx, entry, peers); err != nil {
-						slog.ErrorContext(ctx, "failed to apply log entry", "index", entry.Index, "op", entry.Op, "error", err)
-						appliedAll = false
-						break // Retry from the same pointer next time
+						slog.ErrorContext(ctx, "failed to apply log entry, deferring to background retry", "index", entry.Index, "op", entry.Op, "part_id", entry.Part.ID, "error", err)
+						l.mu.Lock()
+						l.pendingParts[entry.Part.ID] = pendingEntry{meta: entry.Part, oldParts: entry.OldParts}
+						l.mu.Unlock()
 					}
 
 					pointer = entry.Index
@@ -237,7 +238,7 @@ func (l *LSM) bootstrapFromParts(ctx context.Context) error {
 		if err != nil {
 			slog.WarnContext(ctx, "bootstrap: peer unreachable, will retry", "id", id, "error", err)
 			l.mu.Lock()
-			l.pendingParts[id] = meta
+			l.pendingParts[id] = pendingEntry{meta: meta}
 			l.mu.Unlock()
 			continue
 		}
@@ -411,6 +412,14 @@ type pendingAttempt struct {
 	nextAt time.Time
 }
 
+// pendingEntry is an entry in the pending-retry queue.
+// For a failed OpMerge, oldParts names the parts superseded by this one;
+// retryPendingParts removes them from l.parts on successful fetch.
+type pendingEntry struct {
+	meta     shrimptypes.PartMeta
+	oldParts []string
+}
+
 func (pa pendingAttempt) delay() time.Duration {
 	if pa.count == 0 {
 		return 0
@@ -446,15 +455,15 @@ func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
 		return
 	}
 	type work struct {
-		id   string
-		meta shrimptypes.PartMeta
+		id    string
+		entry pendingEntry
 	}
 	var due []work
-	for id, meta := range l.pendingParts {
+	for id, entry := range l.pendingParts {
 		if pa := l.pendingAttempts[id]; now.Before(pa.nextAt) {
 			continue
 		}
-		due = append(due, work{id, meta})
+		due = append(due, work{id, entry})
 	}
 	l.mu.RUnlock()
 
@@ -463,7 +472,17 @@ func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
 			return
 		}
 
-		raw, err := fetchRemotePart(ctx, w.meta, peers, remoteHTTP)
+		exists, err := l.reg.PartExists(ctx, w.id)
+		if err == nil && !exists {
+			slog.InfoContext(ctx, "dropping superseded pending part", "id", w.id)
+			l.mu.Lock()
+			delete(l.pendingParts, w.id)
+			delete(l.pendingAttempts, w.id)
+			l.mu.Unlock()
+			continue
+		}
+
+		raw, err := fetchRemotePart(ctx, w.entry.meta, peers, remoteHTTP)
 		if err != nil {
 			l.bumpPendingBackoff(w.id, now)
 			l.mu.RLock()
@@ -478,14 +497,14 @@ func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
 			l.bumpPendingBackoff(w.id, now)
 			continue
 		}
-		w.meta.Compression = shrimpblock.DetectAlgo(raw)
-		if err := rebuildPartTokens(l.partPath(w.id), &w.meta); err != nil {
+		w.entry.meta.Compression = shrimpblock.DetectAlgo(raw)
+		if err := rebuildPartTokens(l.partPath(w.id), &w.entry.meta); err != nil {
 			_ = os.Remove(l.partPath(w.id))
 			slog.WarnContext(ctx, "pending part: rebuild tokens failed", "id", w.id, "error", err)
 			l.bumpPendingBackoff(w.id, now)
 			continue
 		}
-		if err := WriteMeta(l.partMetaPath(w.id), w.meta); err != nil {
+		if err := WriteMeta(l.partMetaPath(w.id), w.entry.meta); err != nil {
 			_ = os.Remove(l.partPath(w.id))
 			slog.WarnContext(ctx, "pending part: write meta failed", "id", w.id, "error", err)
 			l.bumpPendingBackoff(w.id, now)
@@ -493,15 +512,28 @@ func (l *LSM) retryPendingParts(ctx context.Context, peers []string) {
 		}
 
 		l.mu.Lock()
-		l.parts = append(l.parts, w.meta)
+		if len(w.entry.oldParts) > 0 {
+			oldSet := make(map[string]struct{}, len(w.entry.oldParts))
+			for _, id := range w.entry.oldParts {
+				oldSet[id] = struct{}{}
+			}
+			next := l.parts[:0:0]
+			for _, p := range l.parts {
+				if _, superseded := oldSet[p.ID]; !superseded {
+					next = append(next, p)
+				}
+			}
+			l.parts = next
+		}
+		l.parts = append(l.parts, w.entry.meta)
 		delete(l.pendingParts, w.id)
 		delete(l.pendingAttempts, w.id)
 		l.mu.Unlock()
 
 		slog.InfoContext(ctx, "fetched previously pending part", "id", w.id)
 
-		if pf, err := l.partMgr.Get(w.id, w.meta); err == nil && pf != nil {
-			if err := l.idxEngine.ReindexPartFile(ctx, w.meta, pf); err != nil {
+		if pf, err := l.partMgr.Get(w.id, w.entry.meta); err == nil && pf != nil {
+			if err := l.idxEngine.ReindexPartFile(ctx, w.entry.meta, pf); err != nil {
 				slog.WarnContext(ctx, "pending part: reindex failed", "id", w.id, "error", err)
 			}
 		}

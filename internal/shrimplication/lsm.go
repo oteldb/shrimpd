@@ -40,6 +40,7 @@ type registryAPI interface {
 	GetQueuePointer(ctx context.Context) (int64, error)
 	SetQueuePointer(ctx context.Context, index int64) error
 	GetLivePeerAddrs(ctx context.Context, excludeID string) ([]string, error)
+	PartExists(ctx context.Context, id string) (bool, error)
 }
 
 // LSM owns local writes, local parts, compaction, and distributed reads.
@@ -69,9 +70,9 @@ type LSM struct {
 	// query path reads the mem+parts union and tolerates a part appearing slightly
 	// later, so there is no in-flight-visibility hazard to protect against.
 	mu              sync.RWMutex
-	parts           []shrimptypes.PartMeta          // all parts replicated locally, kept in sync with etcd log
-	pendingParts    map[string]shrimptypes.PartMeta // parts whose peer was unreachable at bootstrap; retried periodically
-	pendingAttempts map[string]pendingAttempt       // per-part retry state
+	parts           []shrimptypes.PartMeta    // all parts replicated locally, kept in sync with etcd log
+	pendingParts    map[string]pendingEntry   // parts whose peer was unreachable; retried periodically
+	pendingAttempts map[string]pendingAttempt // per-part retry state
 
 	idxEngine *IndexEngine // Separate Index Engine
 
@@ -119,7 +120,7 @@ func NewLSM(nodeID, addr, dataDir string, wal *shrimpwal.WAL, reg registryAPI) (
 		idxEngine:       idx,
 		rowBlockCache:   rowBlockCache,
 		partMgr:         NewPartManager(dataDir),
-		pendingParts:    make(map[string]shrimptypes.PartMeta),
+		pendingParts:    make(map[string]pendingEntry),
 		pendingAttempts: make(map[string]pendingAttempt),
 	}
 	// Replay WAL to recover any entries not yet flushed to a part.

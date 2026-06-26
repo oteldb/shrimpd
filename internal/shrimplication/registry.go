@@ -288,6 +288,15 @@ func (r *Registry) GetActiveParts(ctx context.Context) (map[string]shrimptypes.P
 	return active, nil
 }
 
+// PartExists checks if a specific part exists in the active set.
+func (r *Registry) PartExists(ctx context.Context, id string) (bool, error) {
+	resp, err := r.cli.Get(ctx, partsPrefix+id, clientv3.WithCountOnly())
+	if err != nil {
+		return false, err
+	}
+	return resp.Count > 0, nil
+}
+
 // BootstrapSnapshot holds a consistent snapshot of the log tail and active parts.
 type BootstrapSnapshot struct {
 	LogIndex int64

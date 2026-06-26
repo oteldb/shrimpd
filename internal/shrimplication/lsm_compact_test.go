@@ -15,11 +15,12 @@ import (
 )
 
 type stubRegistry struct {
-	appendOp      LogOp
-	appendPart    string
-	appendOld     []string
-	appendMeta    shrimptypes.PartMeta
-	bootstrapSnap BootstrapSnapshot
+	appendOp         LogOp
+	appendPart       string
+	appendOld        []string
+	appendMeta       shrimptypes.PartMeta
+	bootstrapSnap    BootstrapSnapshot
+	partExistsResult bool
 }
 
 func (s *stubRegistry) RegisterNode(context.Context, string) error                { return nil }
@@ -36,6 +37,10 @@ func (s *stubRegistry) LogCleanupLoop(context.Context)                          
 func (s *stubRegistry) GetQueuePointer(context.Context) (int64, error)             { return 0, nil }
 func (s *stubRegistry) SetQueuePointer(context.Context, int64) error               { return nil }
 func (s *stubRegistry) GetLivePeerAddrs(context.Context, string) ([]string, error) { return nil, nil }
+func (s *stubRegistry) PartExists(_ context.Context, _ string) (bool, error) {
+	return s.partExistsResult, nil
+}
+
 func (s *stubRegistry) AppendLog(_ context.Context, op LogOp, part shrimptypes.PartMeta, oldParts []string) (int64, error) {
 	s.appendOp = op
 	s.appendPart = part.ID

@@ -64,8 +64,8 @@ func TestOpMergeClearsPendingParts(t *testing.T) {
 
 	// Simulate old-1 being in pendingParts (e.g. replication was deferred).
 	lsm.mu.Lock()
-	lsm.pendingParts[old1.ID] = old1
-	lsm.pendingParts[old2.ID] = old2
+	lsm.pendingParts[old1.ID] = pendingEntry{meta: old1}
+	lsm.pendingParts[old2.ID] = pendingEntry{meta: old2}
 	lsm.mu.Unlock()
 
 	// A peer announces that old-1 and old-2 were merged into merged.
@@ -105,7 +105,7 @@ func TestBootstrapFromPartsPrunesPending(t *testing.T) {
 
 	// Seed a stale pending entry for a part not in the new snapshot.
 	lsm.mu.Lock()
-	lsm.pendingParts["stale-part"] = shrimptypes.PartMeta{ID: "stale-part", Addr: "127.0.0.1:0"}
+	lsm.pendingParts["stale-part"] = pendingEntry{meta: shrimptypes.PartMeta{ID: "stale-part", Addr: "127.0.0.1:0"}}
 	lsm.mu.Unlock()
 
 	// Snapshot contains only "current".
@@ -158,6 +158,54 @@ func TestFetchRemotePartFallback(t *testing.T) {
 	raw, err := fetchRemotePart(context.Background(), meta, candidates, &http.Client{})
 	require.NoError(t, err)
 	require.NotEmpty(t, raw)
+}
+
+// TestRetryPendingMergeRemovesOldParts verifies that retryPendingParts removes the old
+// (superseded) parts from l.parts when it successfully fetches a deferred OpMerge part.
+// Without this, both the old parts and the merged part would coexist and produce duplicates.
+func TestRetryPendingMergeRemovesOldParts(t *testing.T) {
+	lsm, reg, dir := newTestLSM(t)
+
+	old1 := writeTestPart(t, dir, "old-r1", []shrimptypes.Entry{{Timestamp: 1, Data: "a"}})
+	old2 := writeTestPart(t, dir, "old-r2", []shrimptypes.Entry{{Timestamp: 2, Data: "b"}})
+	merged := writeTestPart(t, dir, "merged-r", []shrimptypes.Entry{
+		{Timestamp: 1, Data: "a"},
+		{Timestamp: 2, Data: "b"},
+	})
+
+	lsm.SetParts([]shrimptypes.PartMeta{old1, old2})
+
+	// Serve the merged part over HTTP.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, dir+"/parts/merged-r.json")
+	}))
+	t.Cleanup(srv.Close)
+	merged.Addr = srv.Listener.Addr().String()
+
+	// Pretend the OpMerge log entry failed and was deferred to pendingParts.
+	lsm.mu.Lock()
+	lsm.pendingParts[merged.ID] = pendingEntry{meta: merged, oldParts: []string{old1.ID, old2.ID}}
+	lsm.mu.Unlock()
+
+	// PartExists must return true so retryPendingParts doesn't drop the entry.
+	reg.partExistsResult = true
+
+	lsm.retryPendingParts(context.Background(), nil)
+
+	lsm.mu.RLock()
+	parts := append([]shrimptypes.PartMeta(nil), lsm.parts...)
+	_, stillPending := lsm.pendingParts[merged.ID]
+	lsm.mu.RUnlock()
+
+	require.False(t, stillPending, "merged part should have been removed from pendingParts")
+
+	ids := make([]string, len(parts))
+	for i, p := range parts {
+		ids[i] = p.ID
+	}
+	require.NotContains(t, ids, old1.ID, "old-r1 should have been removed from l.parts")
+	require.NotContains(t, ids, old2.ID, "old-r2 should have been removed from l.parts")
+	require.Contains(t, ids, merged.ID, "merged-r should be present in l.parts")
 }
 
 // stubRegistry satisfies registryAPI; its fields and methods are defined in lsm_compact_test.go.
