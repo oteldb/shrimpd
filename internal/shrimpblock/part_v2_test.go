@@ -143,6 +143,11 @@ func TestMergeParts(t *testing.T) {
 		{{Timestamp: 3, Data: "c3"}, {Timestamp: 6, Data: "c6"}},
 	}
 	parts := make([]*PartFileV2, 0, len(paths))
+	t.Cleanup(func() {
+		for _, pf := range parts {
+			require.NoError(t, pf.Close())
+		}
+	})
 	for i, path := range paths {
 		_, err := WritePartV2(path, inputs[i])
 		require.NoError(t, err)
