@@ -9,6 +9,7 @@
 
 ## Commands
 - `go build ./cmd/...` builds all three binaries.
+- `E2E=1 go run ./e2e/...` runs end-to-end tests (requires Docker).
 - `make test` runs `./go.test.sh`: normal tests, `-tags purego`, then `-race`, each with `--timeout 5m`.
 - `make test_fast` runs only `go test -short ./...` (skips slow/integration tests).
 - `make coverage` runs `go test -race -v -coverpkg=./... -coverprofile=profile.out ./...` then `go tool cover -func profile.out`.
