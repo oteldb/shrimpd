@@ -151,4 +151,3 @@ require (
 	gotest.tools/v3 v3.5.2 // indirect
 )
 
-replace github.com/go-faster/sdk => /home/tdakkota/workspace/github.com/go-faster/sdk
