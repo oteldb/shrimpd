@@ -30,6 +30,14 @@
   that would resolve it is blocked behind it by the range-conflict rule.
 - **A drop removes what the dropped block covered**, not just the exact key. A lagging replica may
   still hold the merge sources the dropped part replaced, and no later record will mention them.
+- **A replica that must rebuild waits, unless waiting cannot help.** Peers registered but offline ⇒
+  start anyway, set `awaitingClone`, retry each tick. The only registered replica ⇒ fail with an
+  unrecoverable error, since no source exists or ever will. A fresh single-node cluster has no log,
+  so it is never lost and always starts.
+- **A replica that must rebuild waits, unless waiting cannot help.** Peers registered but offline ⇒
+  start anyway, set `awaitingClone`, retry each tick. The only registered replica ⇒ fail with an
+  unrecoverable error, since no source exists or ever will. A fresh single-node cluster has no log,
+  so it is never lost and always starts.
 - `memkv` mirrors etcd's transaction rules exactly — two writes to one key conflict, a write inside
   a delete range conflicts, deletes never conflict with each other. Being *stricter* than etcd is
   as much a bug as being laxer; `replication/kvtest` holds both implementations to the same suite.

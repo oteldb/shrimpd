@@ -84,3 +84,8 @@ func TrimLogForTest[B Block](ctx context.Context, r *Replication[B]) error {
 func UnmarshalRecordForTest[B Block](data []byte) (Record[B], error) {
 	return unmarshalRecord[B](data)
 }
+
+// RetryCloneForTest runs the deferred-rebuild attempt the Run loop makes each tick.
+func RetryCloneForTest[B Block](ctx context.Context, r *Replication[B]) error {
+	return r.retryClone(ctx)
+}

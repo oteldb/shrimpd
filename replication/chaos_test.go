@@ -212,35 +212,104 @@ func TestLogGapForcesClone(t *testing.T) {
 	require.Empty(t, b.repl.Inspect().Queue)
 }
 
-// TestCloneFailsWithoutHealthyPeer requires a replica that must clone, but has nobody to clone
-// from, to refuse to start.
+// TestFirstReplicaOfNewClusterStarts pins the ordinary single-node case: an empty prefix has no
+// log, so nothing needs cloning and the replica is healthy from the start.
+func TestFirstReplicaOfNewClusterStarts(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t)
+	only := c.add("only")
+
+	require.False(t, only.repl.AwaitingClone())
+
+	want := replication.Key(only.flush(t, "only"))
+	c.converge()
+	require.Equal(t, []string{want}, only.store.keys())
+}
+
+// TestSoleReplicaThatLostItsDataFailsLoudly covers the case where waiting cannot help: the
+// replica must rebuild, and it is the only one ever registered, so no source exists or ever will.
 //
-// Declaring itself healthy on an empty store would be far worse than failing: it would advertise
-// itself as a fetch source holding nothing, and a peer cloning from it would adopt that emptiness
-// as the truth.
-func TestCloneFailsWithoutHealthyPeer(t *testing.T) {
+// Retrying forever would hide an unrecoverable cluster behind a healthy-looking process; coming up
+// regardless would be worse still, since the replica would advertise itself as a source holding
+// nothing.
+func TestSoleReplicaThatLostItsDataFailsLoudly(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t)
+	only := c.add("only")
+	only.flush(t, "only")
+
+	// The single replica discovers its local state is untrustworthy — a trimmed log, say. There
+	// is no other replica registered, so no source exists or ever will.
+	require.NoError(t, replication.MarkLostForTest(t.Context(), only.repl))
+
+	err := replication.RecoverForTest(t.Context(), only.repl)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, replication.ErrCloneUnavailable,
+		"an unrecoverable cluster must not look like a transient outage that will resolve itself")
+	require.Contains(t, err.Error(), "unrecoverable")
+}
+
+// TestNewReplicaWaitsForAnOfflinePeer covers the case where waiting is exactly right: peers are
+// registered but none is up yet, so the replica starts, holds off, and rebuilds when one returns.
+func TestNewReplicaWaitsForAnOfflinePeer(t *testing.T) {
 	t.Parallel()
 
 	c := newCluster(t)
 	a := c.add("a")
-	a.flush(t, "a")
+	want := replication.Key(a.flush(t, "a"))
 
-	// The only live replica goes away, leaving a log but no source.
+	// a is registered but its session is gone — a node that is down, not decommissioned.
 	require.NoError(t, a.kv.Close())
 	delete(c.nodes, "a")
 
-	lonely, err := replication.New(replication.Config[testBlock]{
+	joinerStore := newFakeStore("joiner", c.peers)
+	c.peers.add("joiner:8080", joinerStore)
+
+	joiner, err := replication.New(replication.Config[testBlock]{
 		KV:      c.space.Session(),
-		Store:   newFakeStore("lonely", c.peers),
+		Store:   joinerStore,
 		Prefix:  testPrefix,
-		Replica: "lonely",
-		Addr:    "lonely:8080",
+		Replica: "joiner",
+		Addr:    "joiner:8080",
 	})
 	require.NoError(t, err)
 
-	err = lonely.Start(t.Context())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "clone from")
+	require.NoError(t, joiner.Start(t.Context()),
+		"a peer being temporarily down must not prevent startup")
+	require.True(t, joiner.AwaitingClone(), "the replica must know it is not yet usable")
+
+	// While waiting it must keep reporting the outage rather than quietly going live.
+	require.ErrorIs(t, replication.RetryCloneForTest(t.Context(), joiner),
+		replication.ErrCloneUnavailable)
+	require.True(t, joiner.AwaitingClone())
+
+	// a comes back with its disk intact — a restart, not a replacement.
+	revivedKV := c.space.Session()
+	t.Cleanup(func() { _ = revivedKV.Close() })
+
+	revived, err := replication.New(replication.Config[testBlock]{
+		KV:      revivedKV,
+		Store:   a.store,
+		Prefix:  testPrefix,
+		Replica: "a",
+		Addr:    a.addr,
+	})
+	require.NoError(t, err)
+	require.NoError(t, revived.Start(t.Context()))
+	require.Equal(t, []string{want}, a.store.keys())
+
+	c.nodes["a"] = &node{name: "a", addr: a.addr, kv: revivedKV, store: a.store, repl: revived}
+
+	// The next attempt now finds a live, healthy source.
+	require.NoError(t, replication.RetryCloneForTest(t.Context(), joiner))
+	require.False(t, joiner.AwaitingClone())
+
+	c.nodes["joiner"] = &node{name: "joiner", addr: "joiner:8080", store: joinerStore, repl: joiner}
+
+	c.converge()
+	require.Equal(t, []string{want}, joinerStore.keys())
 }
 
 // TestExistingReplicaStartsWithoutPeers checks the other side of that rule: a replica that was

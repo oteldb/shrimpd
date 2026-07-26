@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -103,7 +104,18 @@ type Replication[B Block] struct {
 	// commitMu serializes this replica's own log appends. Concurrent appends would contend on
 	// the log-sequence compare-and-swap and retry each other for nothing.
 	commitMu sync.Mutex
+
+	// awaitingClone is set while the replica is lost and has no healthy peer to rebuild from.
+	// It suspends the ordinary loop: pulling the log would be meaningless against local state
+	// that is known to be wrong.
+	awaitingClone atomic.Bool
 }
+
+// ErrCloneUnavailable reports that a replica must rebuild from a peer but none is currently
+// reachable. It is transient by construction — the peers are registered, so they are expected
+// back — and replication retries on its own. A replica that is the only one registered gets a
+// plain error instead, because for it no amount of waiting can help.
+var ErrCloneUnavailable = errors.New("replication: no healthy replica to clone from")
 
 // New validates cfg and returns a Replication. It performs no I/O.
 func New[B Block](cfg Config[B]) (*Replication[B], error) {
@@ -133,8 +145,16 @@ func (r *Replication[B]) Start(ctx context.Context) error {
 		return errors.Wrap(err, "register replica")
 	}
 
+	// A replica that must rebuild but has no live peer right now is not a startup failure: the
+	// peers are registered, so they are expected back. It comes up in the lost state and retries
+	// in Run rather than making the process die and rely on a supervisor to try again.
 	if err := r.recoverIfLost(ctx); err != nil {
-		return errors.Wrap(err, "recover replica")
+		if !errors.Is(err, ErrCloneUnavailable) {
+			return errors.Wrap(err, "recover replica")
+		}
+
+		r.awaitingClone.Store(true)
+		r.lg.Warn("cannot rebuild yet, waiting for a healthy peer", zap.Error(err))
 	}
 
 	if err := r.loadQueue(ctx); err != nil {
@@ -163,6 +183,14 @@ func (r *Replication[B]) Run(ctx context.Context) error {
 		case <-r.kv.Done():
 			return errors.New("replication: metadata session lost")
 		case <-ticker.C:
+			if r.awaitingClone.Load() {
+				if err := r.retryClone(ctx); err != nil {
+					r.lg.Warn("still cannot rebuild", zap.Error(err))
+
+					continue
+				}
+			}
+
 			if err := r.pull(ctx); err != nil {
 				r.lg.Warn("pull log", zap.Error(err))
 			}
@@ -171,6 +199,27 @@ func (r *Replication[B]) Run(ctx context.Context) error {
 		}
 	}
 }
+
+// retryClone re-attempts a rebuild that could not run at startup, and adopts the resulting queue
+// once it succeeds.
+func (r *Replication[B]) retryClone(ctx context.Context) error {
+	if err := r.recoverIfLost(ctx); err != nil {
+		return err
+	}
+
+	if err := r.loadQueue(ctx); err != nil {
+		return errors.Wrap(err, "load queue after clone")
+	}
+
+	r.awaitingClone.Store(false)
+	r.lg.Info("rebuilt from peer", zap.Uint64("pointer", r.Pointer()))
+
+	return nil
+}
+
+// AwaitingClone reports whether the replica is waiting for a healthy peer to rebuild from. While
+// it is true the replica holds untrustworthy data and is not participating.
+func (r *Replication[B]) AwaitingClone() bool { return r.awaitingClone.Load() }
 
 // Pointer returns the highest log sequence this replica has copied into its queue.
 func (r *Replication[B]) Pointer() uint64 {

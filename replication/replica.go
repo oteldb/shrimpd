@@ -233,10 +233,57 @@ func (r *Replication[B]) cloneSource(ctx context.Context) (name string, pointer 
 	}
 
 	if !found {
-		return "", 0, errors.New("no healthy replica to clone from")
+		// Distinguish "nobody is up right now" from "nobody can ever help". A peer that is
+		// registered but offline will come back; if this replica is the only one registered,
+		// there is no source and never will be, and waiting would hide that forever.
+		others, err := r.registeredPeers(ctx)
+		if err != nil {
+			return "", 0, err
+		}
+
+		if len(others) == 0 {
+			return "", 0, errors.Errorf(
+				"replica %q must rebuild but is the only one registered under %q: "+
+					"its data is unrecoverable — restore it, or clear the prefix to start fresh",
+				r.name, r.prefix)
+		}
+
+		return "", 0, errors.Wrapf(ErrCloneUnavailable,
+			"no healthy replica to clone from (%d registered, none live)", len(others))
 	}
 
 	return best, bestPtr, nil
+}
+
+// registeredPeers returns the names of every other replica that has ever registered, live or not.
+// Registration is durable, so this is what tells a rebuilding replica whether a source could
+// exist at all.
+func (r *Replication[B]) registeredPeers(ctx context.Context) ([]string, error) {
+	values, err := r.kv.List(ctx, r.replicasDir())
+	if err != nil {
+		return nil, errors.Wrap(err, "list replicas")
+	}
+
+	seen := make(map[string]struct{})
+
+	var out []string
+
+	for _, v := range values {
+		name, leaf, ok := cutReplicaKey(r.replicasDir(), v.Key)
+		if !ok || leaf != "pointer" || name == r.name {
+			continue
+		}
+
+		if _, dup := seen[name]; dup {
+			continue
+		}
+
+		seen[name] = struct{}{}
+
+		out = append(out, name)
+	}
+
+	return out, nil
 }
 
 // cloneRecords is the work list for a clone: one create record per peer block this replica does

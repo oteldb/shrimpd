@@ -264,6 +264,9 @@ type State struct {
 	Parts       []shrimpengine.Part `json:"parts"`
 	Replication replication.State   `json:"replication"`
 	LagRecords  uint64              `json:"lag_records"`
+	// AwaitingClone is true while this node must rebuild from a peer but none is reachable. It
+	// holds untrustworthy data and is not serving the cluster until it clears.
+	AwaitingClone bool `json:"awaiting_clone"`
 }
 
 // Inspect reports what this node holds and how far it trails the log.
@@ -279,11 +282,12 @@ func (n *Node) Inspect(ctx context.Context) (State, error) {
 	}
 
 	return State{
-		Node:        n.opts.ID,
-		Addr:        n.opts.Addr,
-		HeadRecords: n.engine.HeadRecords(),
-		Parts:       parts,
-		Replication: n.repl.Inspect(),
-		LagRecords:  lag,
+		Node:          n.opts.ID,
+		Addr:          n.opts.Addr,
+		HeadRecords:   n.engine.HeadRecords(),
+		Parts:         parts,
+		Replication:   n.repl.Inspect(),
+		LagRecords:    lag,
+		AwaitingClone: n.repl.AwaitingClone(),
 	}, nil
 }
