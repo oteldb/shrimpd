@@ -122,23 +122,49 @@ func (c *Client) List(ctx context.Context, addr, prefix string) ([]string, error
 		return nil, err
 	}
 
-	n, read := binary.Uvarint(body)
-	if read <= 0 {
-		return nil, errors.New("malformed key listing")
+	keys, err := decodeKeyList(body)
+	if err != nil {
+		return nil, errors.Wrapf(err, "decode listing from %s", addr)
 	}
 
-	body = body[read:]
+	return keys, nil
+}
+
+// decodeKeyList parses the key framing [ListHandler] writes: a uvarint count followed by that
+// many uvarint-length-prefixed keys.
+//
+// The input comes off the network from another node, so it is never trusted. In particular the
+// count is not used to size the result: a peer claiming to send 2^64 keys would otherwise make
+// this allocate — or panic — before reading a single one. Every key needs at least one byte on
+// the wire, so the remaining length is the only honest upper bound.
+func decodeKeyList(data []byte) ([]string, error) {
+	n, read := binary.Uvarint(data)
+	if read <= 0 {
+		return nil, errors.New("malformed key count")
+	}
+
+	data = data[read:]
+
+	if n > uint64(len(data)) {
+		return nil, errors.Errorf("key count %d exceeds the %d bytes that follow", n, len(data))
+	}
+
 	out := make([]string, 0, n)
 
 	for range n {
-		l, read := binary.Uvarint(body)
-		if read <= 0 || uint64(len(body[read:])) < l {
+		l, read := binary.Uvarint(data)
+		if read <= 0 {
+			return nil, errors.New("malformed key length")
+		}
+
+		data = data[read:]
+
+		if uint64(len(data)) < l {
 			return nil, errors.New("truncated key listing")
 		}
 
-		body = body[read:]
-		out = append(out, string(body[:l]))
-		body = body[l:]
+		out = append(out, string(data[:l]))
+		data = data[l:]
 	}
 
 	return out, nil

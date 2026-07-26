@@ -231,7 +231,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	from := parseInt(q.Get("from"), 0)
 	to := parseInt(q.Get("to"), math.MaxInt64)
-	limit := int(parseInt(q.Get("limit"), 0))
+	limit := parseLimit(q.Get("limit"))
 
 	start := time.Now()
 
@@ -315,6 +315,25 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// parseLimit reads the result cap, treating anything unusable as "no limit" — which is also what
+// omitting it means.
+//
+// It parses straight into an int rather than narrowing an int64, so a value too large for the
+// platform's int is rejected instead of wrapping: on a 32-bit build `?limit=4294967296` would
+// otherwise truncate to zero and quietly turn a bounded query into an unbounded one.
+func parseLimit(s string) int {
+	if s == "" {
+		return 0
+	}
+
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0
+	}
+
+	return n
 }
 
 func parseInt(s string, def int64) int64 {
