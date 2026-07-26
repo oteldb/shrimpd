@@ -11,9 +11,25 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/oteldb/shrimpd/internal/shrimptypes"
 )
+
+// Entry is one log record as the shrimpd query API returns it.
+type Entry struct {
+	Timestamp int64  `json:"timestamp"`
+	Data      string `json:"data"`
+}
+
+// queryStats is the execution summary /query attaches to a response.
+type queryStats struct {
+	EntriesMatched int   `json:"entries_matched"`
+	DurationMs     int64 `json:"duration_ms"`
+}
+
+// queryResponse is the /query response envelope.
+type queryResponse struct {
+	Data  []Entry     `json:"data"`
+	Stats *queryStats `json:"stats,omitempty"`
+}
 
 type otlpScopeJSON struct {
 	Name       string         `json:"name,omitempty"`
@@ -55,7 +71,7 @@ func parseTime(s string, defaultVal int64) (int64, error) {
 	return 0, fmt.Errorf("invalid time/duration format: %q", s)
 }
 
-func formatEntry(e shrimptypes.Entry) string {
+func formatEntry(e Entry) string {
 	ts := time.Unix(0, e.Timestamp).Format("2006-01-02 15:04:05.000000000")
 
 	// Check if it's OTLP log JSON
@@ -107,7 +123,6 @@ func main() {
 	fromStr := flag.String("from", "", "query starting timestamp (duration e.g. 5m, or Unix nanoseconds)")
 	toStr := flag.String("to", "", "query ending timestamp (duration e.g. 1m, or Unix nanoseconds)")
 	termFlag := flag.String("term", "", "filter term (can also be specified as positional arguments)")
-	qFlag := flag.String("q", "", "matcher filter (JSON, same format as GET /query q param)")
 	parseFlag := flag.Bool("parse", false, "enables entry parsing")
 	statsFlag := flag.Bool("stats", false, "prints query execution stats to stderr")
 
@@ -156,9 +171,6 @@ func main() {
 	if term != "" {
 		q.Set("term", term)
 	}
-	if *qFlag != "" {
-		q.Set("q", *qFlag)
-	}
 	if from != 0 {
 		q.Set("from", strconv.FormatInt(from, 10))
 	}
@@ -180,7 +192,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	var block shrimptypes.Block
+	var block queryResponse
 	if err := json.NewDecoder(resp.Body).Decode(&block); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to decode response: %v\n", err)
 		os.Exit(1)
@@ -200,20 +212,7 @@ func main() {
 	}
 
 	if *statsFlag && block.Stats != nil {
-		stats := block.Stats
-		fmt.Fprintf(os.Stderr, "stats: took=%dms parts(total=%d pruned_ts=%d pruned_index=%d scanned=%d) blocks(total=%d pruned_ts=%d pruned_index=%d scanned=%d) entries(scanned=%d matched=%d) used_index=%t\n",
-			stats.DurationMs,
-			stats.PartsTotal,
-			stats.PartsPrunedByTS,
-			stats.PartsPrunedByIndex,
-			stats.PartsScanned,
-			stats.BlocksTotal,
-			stats.BlocksPrunedByTS,
-			stats.BlocksPrunedByIndex,
-			stats.BlocksScanned,
-			stats.EntriesScanned,
-			stats.EntriesMatched,
-			stats.UsedIndex,
-		)
+		fmt.Fprintf(os.Stderr, "stats: took=%dms entries_matched=%d\n",
+			block.Stats.DurationMs, block.Stats.EntriesMatched)
 	}
 }

@@ -1,35 +1,28 @@
 package main
 
-// Playground for LSM + etcd-based distributed log storage.
-// Each node owns its parts on local disk; etcd is the global metadata plane.
+// shrimpd is a replicated log store: each node owns its parts on local disk and etcd carries the
+// replicated log that keeps every node's part set converging.
 //
 // Quick start:
 //
 //	docker run -p 2379:2379 -e ALLOW_NONE_AUTHENTICATION=yes bitnami/etcd:latest
 //
-//	# node 1
-//	go run . -id=node1 -addr=localhost:8080 -data=./data1
+//	go run ./cmd/shrimpd -id=node1 -addr=localhost:8080 -data=./data1
+//	go run ./cmd/shrimpd -id=node2 -addr=localhost:8081 -data=./data2
 //
-//	# node 2
-//	go run . -id=node2 -addr=localhost:8081 -data=./data2
-//
-// Ingest:
+// Ingest into one node:
 //
 //	curl -sX POST localhost:8080/ingest \
 //	  -H 'Content-Type: application/json' \
-//	  -d '{"data":[{"timestamp":1,"data":"foo"},{"timestamp":3,"data":"baz"}]}'
+//	  -d '{"data":[{"timestamp":1,"data":"foo"}]}'
 //
-//	curl -sX POST localhost:8081/ingest \
-//	  -H 'Content-Type: application/json' \
-//	  -d '{"data":[{"timestamp":2,"data":"bar"}]}'
+// Query from the other — replication has already carried the part across:
 //
-// Query across both nodes (from either):
+//	curl -s 'localhost:8081/query?from=0&to=9' | jq .
 //
-//	curl -s 'localhost:8080/read?from=1&to=3' | jq .
+// Inspect this node's parts and replication lag:
 //
-// Inspect global parts (from etcd):
-//
-//	curl -s localhost:8080/parts | jq .
+//	curl -s localhost:8080/state | jq .
 
 import (
 	"context"
@@ -54,8 +47,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/oteldb/shrimpd/internal/shrimpapi"
-	"github.com/oteldb/shrimpd/internal/shrimplication"
-	shrimpwal "github.com/oteldb/shrimpd/internal/shrimpwal"
+	"github.com/oteldb/shrimpd/internal/shrimpnode"
+	"github.com/oteldb/shrimpd/replication/etcdkv"
 )
 
 // bytesFlag is a custom flag type that allows human-readable byte sizes (e.g., "10MB") to be parsed into uint64 values.
@@ -87,10 +80,12 @@ func (b *bytesFlag) Set(s string) error {
 
 func main() {
 	var (
-		nodeID  = flag.String("id", "node1", "unique node identifier")
-		addr    = flag.String("addr", "localhost:8080", "HTTP listen + advertise address (host:port)")
-		dataDir = flag.String("data", "./data", "directory for parts and WAL")
-		etcdEps = flag.String("etcd", "localhost:2379", "etcd endpoints, comma-separated")
+		nodeID     = flag.String("id", "node1", "unique node identifier")
+		addr       = flag.String("addr", "localhost:8080", "HTTP listen + advertise address (host:port)")
+		dataDir    = flag.String("data", "./data", "directory for parts and WAL")
+		etcdEps    = flag.String("etcd", "localhost:2379", "etcd endpoints, comma-separated")
+		etcdPrefix = flag.String("etcd-prefix", "/shrimpd", "etcd key prefix for this cluster's replication state")
+		retention  = flag.Duration("retention", 0, "drop records older than this on compaction (0 = keep everything)")
 
 		// Profiling flags
 		pprofAddr          = flag.String("pprof", "", "expose net/http/pprof on this address (e.g. :6060); empty = disabled")
@@ -136,7 +131,7 @@ func main() {
 	app.Run(func(ctx context.Context, lg *zap.Logger, _ *app.Telemetry) error {
 		slog.SetDefault(slog.New(slogzap.Option{Level: slog.LevelDebug, Logger: lg}.NewZapHandler()))
 
-		if err := os.MkdirAll(*dataDir+"/parts", 0o750); err != nil {
+		if err := os.MkdirAll(*dataDir, 0o750); err != nil {
 			return fmt.Errorf("create data directory: %w", err)
 		}
 
@@ -149,24 +144,41 @@ func main() {
 		}
 		defer func() {
 			if err := cli.Close(); err != nil {
-				slog.Warn("close etcd client", "error", err)
+				lg.Warn("close etcd client", zap.Error(err))
 			}
 		}()
 
-		wal, err := shrimpwal.OpenWAL(*dataDir + "/wal.jsonl")
+		kv, err := etcdkv.New(ctx, cli, 0)
 		if err != nil {
-			return fmt.Errorf("open wal: %w", err)
+			return fmt.Errorf("open metadata session: %w", err)
 		}
 		defer func() {
-			if err := wal.Close(); err != nil {
-				slog.Warn("close wal", "error", err)
+			if err := kv.Close(); err != nil {
+				lg.Warn("close metadata session", zap.Error(err))
 			}
 		}()
-		reg := shrimplication.NewRegistry(cli, *nodeID)
 
-		lsm, err := shrimplication.NewLSM(*nodeID, *addr, *dataDir, wal, reg)
+		node, err := shrimpnode.New(ctx, shrimpnode.Options{
+			Dir:       *dataDir,
+			ID:        *nodeID,
+			Addr:      *addr,
+			KV:        kv,
+			Prefix:    *etcdPrefix,
+			Retention: *retention,
+			Logger:    lg,
+		})
 		if err != nil {
-			return fmt.Errorf("create lsm: %w", err)
+			return fmt.Errorf("open node: %w", err)
+		}
+		defer func() {
+			if err := node.Close(context.WithoutCancel(ctx)); err != nil {
+				lg.Warn("close node", zap.Error(err))
+			}
+		}()
+
+		srv, err := shrimpapi.NewServer(*addr, node, lg)
+		if err != nil {
+			return fmt.Errorf("create http server: %w", err)
 		}
 
 		// Background heap monitor: auto-dump when threshold crossed, and on SIGUSR1.
@@ -178,8 +190,8 @@ func main() {
 		}
 
 		eg, ctx := errgroup.WithContext(ctx)
-		eg.Go(func() error { return lsm.Run(ctx) })
-		eg.Go(func() error { return shrimpapi.NewServer(*addr, lsm).Run(ctx) })
+		eg.Go(func() error { return node.Run(ctx) })
+		eg.Go(func() error { return srv.Run(ctx) })
 		return eg.Wait()
 	}, app.WithContext(ctx), app.WithServiceName("shrimpd"))
 }
