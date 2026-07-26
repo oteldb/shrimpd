@@ -9,9 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oteldb/storage/query/fetch"
 	"github.com/oteldb/storage/signal"
 	slog "github.com/oteldb/storage/signal/log"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zaptest"
 
 	"github.com/oteldb/shrimpd/internal/shrimpengine"
 	"github.com/oteldb/shrimpd/replication"
@@ -51,9 +53,12 @@ func newNode(t *testing.T, space *memkv.Space, name string) *node {
 	kv := space.Session()
 	t.Cleanup(func() { _ = kv.Close() })
 
+	lg := zaptest.NewLogger(t)
+
 	repl, err := replication.New(replication.Config[shrimpengine.Part]{
 		KV:           kv,
-		Store:        shrimpengine.NewStore(engine, shrimpengine.NewClient(nil), nil),
+		Logger:       lg,
+		Store:        shrimpengine.NewStore(engine, shrimpengine.NewClient(nil), lg),
 		Prefix:       "/shrimpd/logs",
 		Replica:      name,
 		Addr:         addr,
@@ -62,7 +67,21 @@ func newNode(t *testing.T, space *memkv.Space, name string) *node {
 	require.NoError(t, err)
 	require.NoError(t, repl.Start(t.Context()))
 
-	go func() { _ = repl.Run(t.Context()) }()
+	// Stop the loop and wait for it before the test finishes: a zaptest logger must not be
+	// written to once its test has completed.
+	runCtx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		_ = repl.Run(runCtx)
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 
 	return &node{name: name, addr: addr, engine: engine, repl: repl}
 }
@@ -254,6 +273,38 @@ func TestQueryRespectsWindow(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.Equal(t, "in-window", entries[0].Data)
+}
+
+func TestBodyContainsFiltersCaseInsensitively(t *testing.T) {
+	t.Parallel()
+
+	space := memkv.NewSpace()
+	a := newNode(t, space, "a")
+
+	a.ingest(t, 1000, "error: disk full", "info: all good", "ERROR: retrying")
+
+	cond := []fetch.Condition{shrimpengine.BodyContains("error")}
+
+	// Once from the head, and again after the records are a part on disk — the condition has to
+	// hold on both sides of a flush, and the part path additionally runs it past the body bloom.
+	for _, stage := range []string{"head", "part"} {
+		entries, err := a.engine.Query(t.Context(), 0, 1<<62, cond, 0)
+		require.NoError(t, err, stage)
+
+		got := make([]string, 0, len(entries))
+		for _, e := range entries {
+			got = append(got, e.Data)
+		}
+
+		slices.Sort(got)
+		require.Equal(t, []string{"ERROR: retrying", "error: disk full"}, got, stage)
+
+		if stage == "head" {
+			_, ok, err := a.engine.Flush(t.Context())
+			require.NoError(t, err)
+			require.True(t, ok)
+		}
+	}
 }
 
 func TestRecoversHeadFromWALAcrossRestart(t *testing.T) {

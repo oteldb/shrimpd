@@ -80,7 +80,7 @@ func clearEtcd(ctx context.Context, t testing.TB, endpoint string) {
 	})
 	require.NoError(t, err)
 	defer func() { require.NoError(t, cli.Close()) }()
-	_, err = cli.Delete(ctx, "/lsm/", clientv3.WithPrefix())
+	_, err = cli.Delete(ctx, "/shrimpd/", clientv3.WithPrefix())
 	require.NoError(t, err)
 }
 

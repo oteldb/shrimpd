@@ -2,6 +2,7 @@ package shrimpengine
 
 import (
 	"context"
+	"sync"
 
 	"github.com/go-faster/errors"
 	"github.com/oteldb/storage/backend"
@@ -20,6 +21,13 @@ type Store struct {
 	engine *Engine
 	client *Client
 	lg     *zap.Logger
+
+	// indexMu serializes the read-modify-write of a partition's bucket index. Replication
+	// executes non-conflicting queue entries concurrently, and two entries installing different
+	// parts of the same partition would otherwise each load the index, add their own entry, and
+	// save — silently losing one of the two parts. Only the index update is guarded; the object
+	// copying that dominates a fetch happens outside it.
+	indexMu sync.Mutex
 }
 
 var _ replication.Store[Part] = (*Store)(nil)
@@ -148,19 +156,8 @@ func (s *Store) Drop(ctx context.Context, p Part) error {
 	be := s.engine.Backend()
 	indexKey := p.Node + "/" + bucketindex.Object
 
-	ix, err := s.engine.index(ctx, p.Node)
-	if err != nil {
-		return err
-	}
-
-	if ix.Remove(p.Prefix()) {
-		if err := ix.Save(ctx, be, indexKey); err != nil {
-			return errors.Wrapf(err, "save index of %q", p.Node)
-		}
-
-		if err := s.reload(ctx, p.Node); err != nil {
-			return err
-		}
+	if err := s.unreference(ctx, p, indexKey); err != nil {
+		return errors.Wrapf(err, "unreference %s", p.Prefix())
 	}
 
 	keys, err := be.List(ctx, p.Prefix()+"/")
@@ -179,11 +176,34 @@ func (s *Store) Drop(ctx context.Context, p Part) error {
 	return nil
 }
 
-// Publish adds a locally produced part to its partition index. A local flush or merge has already
-// done this through the engine, so this is only used by the fetch path — it is exported for the
-// tests that drive installation directly.
+// unreference removes a part from its partition index, under the index lock. Dropping a part that
+// the index no longer names is a no-op, which is what makes [Store.Drop] idempotent.
+func (s *Store) unreference(ctx context.Context, p Part, indexKey string) error {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+
+	ix, err := s.engine.index(ctx, p.Node)
+	if err != nil {
+		return err
+	}
+
+	if !ix.Remove(p.Prefix()) {
+		return nil
+	}
+
+	if err := ix.Save(ctx, s.engine.Backend(), indexKey); err != nil {
+		return errors.Wrapf(err, "save index of %q", p.Node)
+	}
+
+	return s.reload(ctx, p.Node)
+}
+
+// publish adds a fetched part to its partition index — the commit point that makes it visible.
 func (s *Store) publish(ctx context.Context, p Part) error {
 	indexKey := p.Node + "/" + bucketindex.Object
+
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
 
 	ix, err := s.engine.index(ctx, p.Node)
 	if err != nil {

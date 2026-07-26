@@ -24,6 +24,7 @@ import (
 	"io"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/go-faster/errors"
@@ -464,6 +465,25 @@ func (e *Engine) partsOf(ctx context.Context, partition string) ([]Part, error) 
 	}
 
 	return out, nil
+}
+
+// BodyContains returns the condition selecting records whose body contains term,
+// case-insensitively.
+//
+// The token hint lets the engine skip whole parts using their body bloom before decoding
+// anything; Match is still applied per row, so the hint only ever saves work.
+func BodyContains(term string) fetch.Condition {
+	lowered := strings.ToLower(term)
+
+	return fetch.Condition{
+		Column: slog.ColBody,
+		Tokens: [][]byte{[]byte(lowered)},
+		Match: func(v signal.Value) bool {
+			// AppendText, not Bytes: the record engine hands a bytes column over as a *string*
+			// value, and Value.Bytes returns nil for anything but KindBytes.
+			return strings.Contains(strings.ToLower(string(v.AppendText(nil))), lowered)
+		},
+	}
 }
 
 // Entry is one log record as shrimpd's HTTP API presents it.

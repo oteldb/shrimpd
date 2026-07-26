@@ -164,12 +164,18 @@ func (r *Replication[B]) recoverIfLost(ctx context.Context) error {
 		return err
 	}
 
-	ops := []Op{
+	// Clearing the old queues and writing the new plan are two transactions, because a store may
+	// refuse to range-delete a prefix and write inside that same range at once (etcd does). The
+	// split is safe in the order that matters: the replica stays flagged lost until the second
+	// transaction lands, so a crash in between simply re-runs the clone from the top.
+	if _, err := r.kv.Txn(ctx, Txn{Then: []Op{
 		DeletePrefix(r.queueDir(r.name)),
 		DeletePrefix(r.bootstrapDir(r.name)),
-		Put(r.pointerKey(r.name), []byte(strconv.FormatUint(pointer, 10))),
-		Put(r.lostKey(r.name), []byte(lostNo)),
+	}}); err != nil {
+		return errors.Wrap(err, "clear queue")
 	}
+
+	ops := make([]Op, 0, len(records)+2)
 
 	for i, rec := range records {
 		data, err := marshalRecord(rec)
@@ -179,6 +185,13 @@ func (r *Replication[B]) recoverIfLost(ctx context.Context) error {
 
 		ops = append(ops, Put(r.bootstrapKey(r.name, uint64(i)), data))
 	}
+
+	// The lost flag clears in the same transaction that installs the plan, so the replica never
+	// advertises itself healthy while holding only part of its work list.
+	ops = append(ops,
+		Put(r.pointerKey(r.name), []byte(strconv.FormatUint(pointer, 10))),
+		Put(r.lostKey(r.name), []byte(lostNo)),
+	)
 
 	if _, err := r.kv.Txn(ctx, Txn{Then: ops}); err != nil {
 		return errors.Wrap(err, "install clone plan")

@@ -44,7 +44,7 @@ func postJSON(ctx context.Context, t testing.TB, url string, v any) {
 	resp, err := http.DefaultClient.Do(req)
 	must.NoError(err)
 	defer resp.Body.Close()
-	must.Equal(http.StatusNoContent, resp.StatusCode, "POST %s: %s", url, resp.Status)
+	must.Equal(http.StatusOK, resp.StatusCode, "POST %s: %s", url, resp.Status)
 }
 
 func getJSON(ctx context.Context, t testing.TB, url string, v any) {

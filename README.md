@@ -1,258 +1,187 @@
 # shrimpd
 
-A distributed, LSM-tree-based log storage daemon written in Go. Each node owns
-its data on local disk; **etcd** is the global metadata and replication plane.
-Nodes discover parts from one another and pull them via HTTP — no shared
-filesystem required.
+A ClickHouse-style **replication mechanism**, generic over what it replicates — plus a small log
+daemon that demonstrates it over [`github.com/oteldb/storage`](https://github.com/oteldb/storage).
 
-## Architecture
+The reusable part is [`replication`](./replication). Storage, encoding, indexing and querying are
+not shrimpd's business: `oteldb/storage` does all of that. shrimpd answers one question — *how do
+several nodes agree on the same set of immutable parts?*
+
+## The model
+
+Straight from ReplicatedMergeTree, reduced to essentials:
 
 ```
-┌──────────────┐   POST /ingest     ┌────────────────────────────────────────┐
-│   Producer   │──────────────────▶ │               shrimpd node             │
-│  (app/otel)  │                    │                                        │
-└──────────────┘                    │  WAL ──▶ MemTable ──▶ Part (V2 binary) │
-                                    │                  │                      │
-                                    │            IndexEngine                  │
-                                    │            (FST token index)            │
-                                    └─────────────────┬──────────────────────┘
-                                                      │
-                                               etcd mutation log
-                                              /lsm/log, /lsm/parts
-                                                      │
-                                    ┌─────────────────▼──────────────────────┐
-                                    │           other shrimpd nodes           │
-                                    │   (pull parts via GET /part/{id})       │
-                                    └────────────────────────────────────────┘
+        ┌──────────── etcd (or any KV) ────────────┐
+        │  /shrimpd/parts/log/000…001  create P1   │   the log: an ordered list of
+        │  /shrimpd/parts/log/000…002  create P2   │   part-set mutations, nothing else
+        │  /shrimpd/parts/log/000…003  merge P1,P2 → P3
+        └──────────────────────────────────────────┘
+             │ pointer                  │ pointer
+        ┌────▼─────┐              ┌─────▼────┐
+        │ replica A│◀── fetch ───▶│ replica B│    data moves node-to-node,
+        │  queue   │   part P3    │  queue   │    never through the log
+        └──────────┘              └──────────┘
 ```
 
-### Write path
+- Every mutation of the part set is appended to **one ordered log**. A record names a part; it
+  never carries data.
+- Each replica keeps a **pointer** into that log and a durable **queue** of records it has copied
+  but not yet executed. Executing means making local disk match: fetch the part from a replica
+  that has it, reproduce a merge locally, or drop what is superseded.
+- A part is identified by its **range**: the inclusive block-number interval `[First, Last]` it
+  covers in its partition, plus a merge `Level`. Containment over ranges is the entire
+  obsolescence calculus — `[1,4]@1` contains `[1,1]@0`, so a replica that fetched the merged part
+  drops the sources without consulting anything.
+- A replica whose state is untrustworthy (new, or fallen behind the retained log) flags itself
+  **lost** and **clones** the healthiest peer's intent: the peer's most-covering parts plus its
+  pending queue become this replica's work list.
 
-1. **WAL** — each `Entry{Timestamp, Data}` is fsynced to a segmented NDJSON
-   write-ahead log before the call returns.
-2. **MemTable** — entries accumulate in memory. When the memtable reaches 100
-   entries **or** 5 s elapses, it is flushed.
-3. **Flush** — entries are sorted by timestamp, serialized into an immutable
-   **V2 binary part** (zstd-compressed blocks, bloom filters per block), and
-   registered in etcd under `/lsm/parts/{id}`. The WAL segment is then
-   discarded.
+## Using the replication mechanism
 
-### Compaction
+Implement three methods to say what a part *is*, and four to say what to *do* with one:
 
-When a level accumulates ≥ 4 parts, up to 4 are merged into a single part at
-the next level. The merged part replaces the inputs atomically in etcd. Old
-part files are garbage-collected after a safety delay. Compaction runs every
-15 s.
+```go
+type Part struct{ Shard string; First, Last, Level uint64 }
 
-### Replication
+func (p Part) Name() string         { return p.Range().String() }
+func (p Part) Partition() string    { return p.Shard }
+func (p Part) Range() shrimpd.Range { return shrimpd.Range{First: p.First, Last: p.Last, Level: p.Level} }
 
-Replication is **pull-based via the etcd mutation log** (`/lsm/log/{index}`).
-On startup each node bootstraps from the latest etcd snapshot and downloads any
-missing parts from peers (`GET /part/{id}`). A background loop (1 s tick) then
-replays new log entries; for `OpPut` and `OpMerge` events it fetches the
-relevant part from the originating node. Each node tracks its position with a
-persistent *queue pointer* in etcd.
+type Store interface {
+    Local(ctx) ([]Part, error)               // what is on disk
+    Fetch(ctx, addr string, p Part) error    // copy p from the peer at addr
+    Merge(ctx, src []Part, dst Part) error   // reproduce a merge, or decline
+    Drop(ctx, p Part) error                  // p is superseded
+}
+```
 
-### Index engine
+Then run it:
 
-A secondary token-to-part index is maintained as [vellum](https://github.com/blevesearch/vellum)
-FST files under `<dataDir>/index/`. The index enables queries to skip parts
-that cannot contain a given token — pruning is reported in query stats as
-`parts_pruned_by_index`. The index is compacted in lockstep with data
-compaction and stale entries (pointing to deleted parts) are pruned automatically.
+```go
+r, err := shrimpd.NewReplication(shrimpd.Config[Part]{
+    KV:      kv,             // etcdkv.New(...) or memkv.New()
+    Store:   myStore,
+    Prefix:  "/myapp/parts",
+    Replica: nodeID,
+    Addr:    advertisedAddr, // passed verbatim to Store.Fetch
+})
+if err := r.Start(ctx); err != nil { return err }
+go r.Run(ctx)
 
-### Storage layout
+// After writing a part locally:
+r.Commit(ctx, part)
+// After merging locally:
+r.CommitMerge(ctx, sources, merged)
+```
+
+Replication never touches the network itself. `Addr` is an opaque string it hands to
+`Store.Fetch`; the transport is entirely yours.
+
+`Store.Merge` may return `shrimpd.ErrMergeUnsupported` to say "don't reproduce this, fetch the
+result" — which is what the daemon does, since the merge already happened elsewhere and its bytes
+can simply be copied.
+
+### The KV seam
+
+Replication needs an ordered, revisioned key/value space with atomic conditional transactions and
+session-scoped ephemeral keys — six methods, in [`replication.KV`](./replication/kv.go).
+
+| Implementation | Use |
+|---|---|
+| [`replication/etcdkv`](./replication/etcdkv) | etcd v3, ephemeral keys on a session lease |
+| [`replication/memkv`](./replication/memkv) | in-process; several sessions share one keyspace |
+
+`memkv` deliberately enforces etcd's rules (including its refusal to range-delete a prefix and
+write inside it in one transaction), so a bug cannot pass the fast tests and fail only in
+production.
+
+## The daemon
+
+`shrimpd` is a log store built on the above: `oteldb/storage`'s record engine for the data,
+`replication` for the cluster.
+
+**Each node writes only its own partition.** A record engine names parts from a node-local
+counter, so confining writes to one writer per partition is what makes a part's object keys
+identical on every replica — which is what lets replication copy those objects verbatim instead
+of re-encoding them. A node holds one writable engine and a read-only engine per peer partition;
+queries fan out across all of them.
 
 ```
 <dataDir>/
-  wal-000001.jsonl          # segmented WAL (active + sealed segments)
-  index-wal.jsonl           # index WAL
+  wal/                             write-ahead log (storage/wal)
   parts/
-    <id>.json               # V2 binary part data (magic SHMP, zstd blocks)
-    <id>.meta               # PartMeta JSON sidecar
-  index/
-    <id>.fst                # vellum FST index parts
-    <id>.meta
+    <node>/bucket-index.bin        the part list — written last, the commit point
+    <node>/streams.bin             stream identity index
+    <node>/<seq>/…                 one immutable part's column objects
 ```
 
-Part IDs have the form `<unix-nano>-<node-id>`, giving a natural temporal sort.
-
-## Binaries
+### Binaries
 
 | Binary | Description |
-|--------|-------------|
-| `shrimpd` | Storage daemon — ingest, query, compaction, replication |
-| `shrimply` | Command-line query client |
-| `shrimpgateway` | Round-robin HTTP gateway for multi-node deployments |
-| `ch2shrimpd` | One-shot importer: reads from ClickHouse `logs` table, ingests into shrimpd |
+|---|---|
+| `shrimpd` | the daemon: ingest, query, replication |
+| `shrimply` | command-line query client |
+| `shrimpgateway` | round-robin HTTP gateway across nodes |
+| `ch2shrimpd` | one-shot importer from a ClickHouse `logs` table |
 
-## HTTP API
-
-All endpoints are served by `shrimpd`.
+### HTTP API
 
 | Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/ingest` | Ingest a batch of log entries (JSON) |
-| `POST` | `/ingest/otlp` | Ingest OTLP logs (JSON or protobuf) |
-| `POST` | `/v1/logs` | OTLP HTTP receiver alias |
-| `GET` | `/query` | Query by time range, optional term/matcher filter |
-| `GET` | `/read` | Alias for `/query` |
-| `GET` | `/part/{id}` | Serve a raw part to peer nodes |
-| `GET` | `/parts` | List all active parts from etcd (debug) |
-| `POST` | `/flush` | Force immediate memtable flush |
-| `POST` | `/compact` | Force immediate compaction |
+|---|---|---|
+| `POST` | `/ingest` | `{"data":[{"timestamp":<ns>,"data":"line"}]}` |
+| `POST` | `/ingest/otlp`, `/v1/logs` | OTLP logs (protobuf or JSON) |
+| `GET` | `/query`, `/read` | `?from=<ns>&to=<ns>&term=<substring>&limit=<n>` |
+| `GET` | `/state`, `/parts` | parts held, replication queue, lag |
+| `POST` | `/flush` | write the head to a part and announce it |
+| `POST` | `/compact` | merge this node's parts and announce it |
+| `GET` | `/internal/parts/{list,object}` | how peers copy this node's part objects |
 
-### Ingest
+There is no query language: matching is the storage layer's job. `term` is a substring over the
+record body, pushed down to the per-part body bloom so whole parts are skipped before scanning.
 
-```http
-POST /ingest
-Content-Type: application/json
-
-{"data":[{"timestamp":1700000000000000000,"data":"hello world"}]}
-```
-
-- `timestamp` — Unix nanoseconds
-- `data` — raw log line string
-
-### Query
-
-```
-GET /query?from=<ns>&to=<ns>&term=<substring>&q=<matcher-json>
-```
-
-- `from` / `to` — nanosecond timestamps (inclusive); omit for open bounds
-- `term` — substring filter applied to each entry's `data` field
-- `q` — structured matcher (JSON):
-
-```json
-{
-  "line":   [{"op":"|=","v":"ERROR"}],
-  "labels": [{"l":"service","op":"eq","v":"api"}]
-}
-```
-
-Line ops: `|=` (eq), `!=` (ne), `|~` (re), `!~` (nre).  
-Label ops: `eq`, `ne`, `re`, `nre`.
-
-Response:
-
-```json
-{
-  "data": [{"timestamp":1700000000000000000,"data":"hello world"}],
-  "stats": {
-    "parts_total": 5,
-    "parts_pruned_by_ts": 2,
-    "parts_pruned_by_index": 1,
-    "parts_scanned": 2,
-    "blocks_total": 40,
-    "blocks_pruned_by_ts": 15,
-    "blocks_pruned_by_index": 3,
-    "blocks_scanned": 22,
-    "entries_scanned": 1100,
-    "entries_matched": 7,
-    "used_index": true,
-    "duration_ms": 12
-  }
-}
-```
-
-## Quick start
-
-### Single node
+### Quick start
 
 ```bash
-# Start etcd
 docker run -p 2379:2379 -e ALLOW_NONE_AUTHENTICATION=yes bitnami/etcd:latest
 
-# Start shrimpd
-go run ./cmd/shrimpd -id=node1 -addr=localhost:8080 -data=./data
+go run ./cmd/shrimpd -id=node1 -addr=localhost:8080 -data=./data1
+go run ./cmd/shrimpd -id=node2 -addr=localhost:8081 -data=./data2
 
-# Ingest
-curl -sX POST localhost:8080/ingest \
-  -H 'Content-Type: application/json' \
-  -d '{"data":[{"timestamp":1700000000000000000,"data":"hello from shrimpd"}]}'
+curl -sX POST localhost:8080/ingest -H 'Content-Type: application/json' \
+  -d '{"data":[{"timestamp":1,"data":"hello"}]}'
+curl -sX POST localhost:8080/flush
 
-# Query (last 5 minutes)
-go run ./cmd/shrimply -from=5m
+# node2 has it, fetched from node1
+curl -s 'localhost:8081/query?from=0&to=9' | jq .
 ```
 
-### Multi-node with Docker Compose
+`example/` has a three-node compose setup behind `shrimpgateway`.
 
-The `example/` directory contains a ready-made three-node cluster behind a
-`shrimpgateway`.
-
-```bash
-cd example
-docker compose up --build
-```
-
-Nodes are reachable at `shrimpd-1:8080`, `shrimpd-2:8080`, `shrimpd-3:8080`;
-the gateway listens on `localhost:8080` and round-robins ingest across them.
-Any node can answer queries covering the full dataset via pull replication.
-
-## Configuration
-
-### shrimpd flags
+### Flags
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `-id` | `node1` | Unique node identifier |
-| `-addr` | `localhost:8080` | HTTP listen/advertise address |
-| `-data` | `./data` | Data directory (parts + WAL) |
-| `-etcd` | `localhost:2379` | Comma-separated etcd endpoints |
-| `-memlimit` | `0` | Soft memory limit (e.g. `400MiB`); sets `GOMEMLIMIT` |
-| `-pprof` | *(disabled)* | Expose `net/http/pprof` on this address |
-| `-cpuprofile` | *(disabled)* | Write CPU profile to file on exit |
-| `-memprofile-dir` | *(disabled)* | Directory for automatic heap profiles |
-| `-memprofile-threshold` | `0` | Heap size that triggers an automatic heap dump |
-| `-memprofile-interval` | `30s` | How often to sample heap for threshold check |
-
-### shrimpgateway flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-addr` | `:8080` | Listen address |
-| `-upstreams` | *(see binary)* | Comma-separated shrimpd URLs |
-
-### shrimply flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-server` / `-s` | `http://localhost:8080` | shrimpd address |
-| `-from` | *(none)* | Start time: Go duration (`5m`) or Unix nanoseconds |
-| `-to` | *(none)* | End time: Go duration or Unix nanoseconds |
-| `term` (positional) | *(none)* | Substring filter |
-| `-q` | *(none)* | Structured matcher JSON |
-| `-n` / `-limit` | `100` | Max entries to display (0 = unlimited) |
-| `-parse` | `false` | Pretty-print OTLP log JSON entries |
-| `-stats` | `false` | Print query execution stats to stderr |
-
-## Observability
-
-- **Structured logging** — `log/slog` JSON to stderr; optionally fanned out to
-  an OTLP endpoint when `OTEL_LOGS_EXPORTER` is set (and not `none`).
-- **pprof** — expose via `-pprof=:6060`; heap profiles can be dumped
-  automatically or on `SIGUSR1` when `-memprofile-dir` is set.
+|---|---|---|
+| `-id` | `node1` | node id: replica name and partition |
+| `-addr` | `localhost:8080` | HTTP listen + advertise address |
+| `-data` | `./data` | data directory |
+| `-etcd` | `localhost:2379` | comma-separated etcd endpoints |
+| `-etcd-prefix` | `/shrimpd` | etcd key prefix for cluster state |
+| `-retention` | `0` | drop records older than this on compaction |
+| `-memlimit` | `0` | soft memory limit, e.g. `400MiB` |
+| `-pprof` | *(off)* | expose `net/http/pprof` on this address |
 
 ## Development
 
 ```bash
-# Run all tests (normal, purego, race)
-make test
-
-# Fast check (skips integration tests)
-make test_fast
-
-# Coverage report
-make coverage
-
-# Format and lint
-golangci-lint fmt ./...
+make test            # normal, purego, race
+make test_fast       # go test -short ./...
+E2E=1 go test ./e2e  # end-to-end; needs Docker
 golangci-lint run ./...
 ```
 
-E2E tests live in `e2e/` and require Docker (testcontainers spins up etcd).
-They are skipped automatically with `-short`.
+The replication tests run a multi-replica cluster in-process over `memkv` — no Docker, a few
+milliseconds. `e2e/` runs the same scenarios against real etcd and real HTTP.
 
 ## License
 

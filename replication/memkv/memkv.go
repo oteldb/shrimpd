@@ -101,8 +101,46 @@ func (st *Store) ListFrom(_ context.Context, prefix, start string, limit int) ([
 	return out, nil
 }
 
+// checkDisjoint rejects a transaction whose operations touch the same key or overlapping ranges.
+//
+// etcd refuses such a transaction ("duplicate key given in txn request"), and a fake that quietly
+// accepts it lets a bug pass every in-process test and fail only against a real cluster. So this
+// store is deliberately as strict as etcd.
+func checkDisjoint(ops []replication.Op) error {
+	for i := range ops {
+		for j := i + 1; j < len(ops); j++ {
+			if opsOverlap(ops[i], ops[j]) {
+				return errors.Errorf(
+					"memkv: duplicate key in txn: %q and %q overlap", ops[i].Key, ops[j].Key)
+			}
+		}
+	}
+
+	return nil
+}
+
+func opsOverlap(a, b replication.Op) bool {
+	aRange := a.Kind == replication.OpDeletePrefix
+	bRange := b.Kind == replication.OpDeletePrefix
+
+	switch {
+	case aRange && bRange:
+		return strings.HasPrefix(a.Key, b.Key) || strings.HasPrefix(b.Key, a.Key)
+	case aRange:
+		return strings.HasPrefix(b.Key, a.Key)
+	case bRange:
+		return strings.HasPrefix(a.Key, b.Key)
+	default:
+		return a.Key == b.Key
+	}
+}
+
 // Txn implements [replication.KV].
 func (st *Store) Txn(_ context.Context, t replication.Txn) (bool, error) {
+	if err := checkDisjoint(t.Then); err != nil {
+		return false, err
+	}
+
 	st.space.mu.Lock()
 	defer st.space.mu.Unlock()
 
