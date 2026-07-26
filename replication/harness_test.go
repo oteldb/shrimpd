@@ -258,7 +258,7 @@ func (c *cluster) add(name string) *node {
 		Addr:    addr,
 	})
 	require.NoError(c.t, err)
-	require.NoError(c.t, repl.Start(c.t.Context()))
+	require.NoError(c.t, replication.StartForTest(c.t.Context(), repl))
 
 	n := &node{name: name, addr: addr, kv: kv, store: store, repl: repl}
 	c.nodes[name] = n

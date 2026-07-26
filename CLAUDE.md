@@ -22,6 +22,14 @@
   first, then the objects.
 - **Announce after durability.** `shrimpnode` flushes/merges locally and only then commits to the
   replicated log, so a peer never learns of a part nobody can serve.
+- **`Replication.Run` is the whole lifecycle** — it joins the cluster and then loops; there is no
+  separate Start to forget. Producers gate on `Ready()`: a node that has not joined must not flush,
+  because its record engine restarts its part counter from the local index and would announce a
+  part name peers already hold for different rows.
+- **`Replication.Run` is the whole lifecycle** — it joins the cluster and then loops; there is no
+  separate Start to forget. Producers gate on `Ready()`: a node that has not joined must not flush,
+  because its record engine restarts its part counter from the local index and would announce a
+  part name peers already hold for different rows.
 - **Block ranges decide obsolescence.** `Contains(a, b)` (interval covers + strictly higher level)
   is the only supersession rule. `recordengine.Merge` compacts *every* part into one, which is
   what keeps a single interval a sound description of coverage.

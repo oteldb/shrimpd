@@ -66,14 +66,18 @@ r, err := shrimpd.NewReplication(shrimpd.Config[Part]{
     Replica: nodeID,
     Addr:    advertisedAddr, // passed verbatim to Store.Fetch
 })
-if err := r.Start(ctx); err != nil { return err }
-go r.Run(ctx)
+go r.Run(ctx) // joins the cluster, then keeps it converged
 
 // After writing a part locally:
 r.Commit(ctx, part)
 // After merging locally:
 r.CommitMerge(ctx, sources, merged)
 ```
+
+`Run` is the whole lifecycle — it registers the replica, rebuilds it if its state is
+untrustworthy, then loops. `Ready()` reports whether it has finished joining; a caller that
+produces new data should gate on it, since a replica that has not established its place in the
+cluster may still be about to rebuild.
 
 Replication never touches the network itself. `Addr` is an opaque string it hands to
 `Store.Fetch`; the transport is entirely yours.

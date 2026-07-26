@@ -251,7 +251,7 @@ func TestQueueSurvivesRestart(t *testing.T) {
 		Addr:    b.addr,
 	})
 	require.NoError(t, err)
-	require.NoError(t, restarted.Start(t.Context()))
+	require.NoError(t, replication.StartForTest(t.Context(), restarted))
 
 	state := restarted.Inspect()
 	require.Len(t, state.Queue, 1)
@@ -337,7 +337,7 @@ func TestCleanupLogKeepsRetentionWindow(t *testing.T) {
 		LogRetention: 3,
 	})
 	require.NoError(t, err)
-	require.NoError(t, repl.Start(t.Context()))
+	require.NoError(t, replication.StartForTest(t.Context(), repl))
 
 	for range 10 {
 		num, err := repl.AllocateBlock(t.Context(), "p")
@@ -371,7 +371,7 @@ func TestRunLoopReplicates(t *testing.T) {
 		PollInterval: 5 * time.Millisecond,
 	})
 	require.NoError(t, err)
-	require.NoError(t, b.Start(t.Context()))
+	require.NoError(t, replication.StartForTest(t.Context(), b))
 
 	go func() { _ = b.Run(t.Context()) }()
 

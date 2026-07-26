@@ -83,10 +83,11 @@ func (c *Config[B]) validate() error {
 
 // Replication replicates a set of blocks across replicas through an ordered log in [KV].
 //
-// One instance owns one replicated set (one Prefix). Create it with [New], bring it online with
-// [Replication.Start], then drive it with [Replication.Run]. The embedder announces its own
-// writes with [Replication.Commit] and [Replication.CommitMerge]; everything else — copying peers'
-// records into the queue, fetching, merging, dropping superseded parts — happens in Run.
+// One instance owns one replicated set (one Prefix). Create it with [New] and run it with
+// [Replication.Run], which joins the cluster and then keeps it converged for as long as it runs.
+// The embedder announces its own writes with [Replication.Commit] and [Replication.CommitMerge];
+// everything else — copying peers' records into the queue, fetching, merging, dropping superseded
+// parts — happens inside Run.
 type Replication[B Block] struct {
 	cfg    Config[B]
 	kv     KV
@@ -105,9 +106,11 @@ type Replication[B Block] struct {
 	// the log-sequence compare-and-swap and retry each other for nothing.
 	commitMu sync.Mutex
 
-	// awaitingClone is set while the replica is lost and has no healthy peer to rebuild from.
-	// It suspends the ordinary loop: pulling the log would be meaningless against local state
-	// that is known to be wrong.
+	// started is set once Run has finished joining the cluster; awaitingClone is set while the
+	// replica is lost and has no healthy peer to rebuild from. Together they are [Ready]:
+	// until then the replica's view is incomplete or known-wrong, and it must not act as if it
+	// were a full member.
+	started       atomic.Bool
 	awaitingClone atomic.Bool
 }
 
@@ -138,9 +141,10 @@ func New[B Block](cfg Config[B]) (*Replication[B], error) {
 // Name returns this replica's name.
 func (r *Replication[B]) Name() string { return r.name }
 
-// Start brings the replica online: it registers itself, recovers or clones its local state, and
-// loads its durable queue. It must return before [Replication.Run] is called.
-func (r *Replication[B]) Start(ctx context.Context) error {
+// start brings the replica online: it registers itself, recovers or clones its local state, and
+// loads its durable queue. [Replication.Run] does this before its first tick; it is not a
+// separate step a caller can forget.
+func (r *Replication[B]) start(ctx context.Context) error {
 	if err := r.register(ctx); err != nil {
 		return errors.Wrap(err, "register replica")
 	}
@@ -165,14 +169,23 @@ func (r *Replication[B]) Start(ctx context.Context) error {
 		return errors.Wrap(err, "publish local parts")
 	}
 
+	r.started.Store(true)
 	r.lg.Info("replication started", zap.Uint64("pointer", r.Pointer()))
 
 	return nil
 }
 
-// Run drives replication until ctx is canceled or the KV session is lost. It pulls new log
-// records into the queue and executes the queue, repeatedly.
+// Run joins the cluster and drives replication until ctx is canceled or the KV session is lost.
+//
+// It registers the replica, rebuilds it if its state is untrustworthy, and then pulls log records
+// into the queue and executes them, repeatedly. Everything a replica needs to participate happens
+// here, so there is no separate step to forget or to get out of order; use [Replication.Ready] to
+// tell whether the replica has finished joining.
 func (r *Replication[B]) Run(ctx context.Context) error {
+	if err := r.start(ctx); err != nil {
+		return err
+	}
+
 	ticker := time.NewTicker(r.cfg.PollInterval)
 	defer ticker.Stop()
 
@@ -220,6 +233,16 @@ func (r *Replication[B]) retryClone(ctx context.Context) error {
 // AwaitingClone reports whether the replica is waiting for a healthy peer to rebuild from. While
 // it is true the replica holds untrustworthy data and is not participating.
 func (r *Replication[B]) AwaitingClone() bool { return r.awaitingClone.Load() }
+
+// Ready reports whether the replica has joined the cluster and holds trustworthy state.
+//
+// It is false before [Replication.Run] has finished joining, and again whenever the replica
+// discovers it must rebuild. A caller that produces new data should check it: announcing parts
+// from a replica that has not established its place in the cluster risks colliding with part
+// names its peers already hold under a previous incarnation.
+func (r *Replication[B]) Ready() bool {
+	return r.started.Load() && !r.awaitingClone.Load()
+}
 
 // Pointer returns the highest log sequence this replica has copied into its queue.
 func (r *Replication[B]) Pointer() uint64 {

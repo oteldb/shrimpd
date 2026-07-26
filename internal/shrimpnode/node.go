@@ -132,10 +132,6 @@ func (n *Node) Close(ctx context.Context) error { return n.engine.Close(ctx) }
 
 // Run joins the cluster and drives replication and maintenance until ctx is canceled.
 func (n *Node) Run(ctx context.Context) error {
-	if err := n.repl.Start(ctx); err != nil {
-		return errors.Wrap(err, "start replication")
-	}
-
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error { return n.repl.Run(ctx) })
 	eg.Go(func() error { return n.maintain(ctx) })
@@ -157,13 +153,15 @@ func (n *Node) maintain(ctx context.Context) error {
 		case <-ctx.Done():
 			// A clean shutdown flushes what the head holds, so a restart does not have to
 			// replay it — but the WAL still covers us if this fails.
-			if err := n.Flush(context.WithoutCancel(ctx)); err != nil {
-				n.lg.Warn("final flush", zap.Error(err))
+			if n.repl.Ready() {
+				if err := n.Flush(context.WithoutCancel(ctx)); err != nil {
+					n.lg.Warn("final flush", zap.Error(err))
+				}
 			}
 
 			return ctx.Err()
 		case <-flushTick.C:
-			if n.engine.HeadRecords() == 0 {
+			if !n.repl.Ready() || n.engine.HeadRecords() == 0 {
 				continue
 			}
 
@@ -171,6 +169,10 @@ func (n *Node) maintain(ctx context.Context) error {
 				n.lg.Error("flush", zap.Error(err))
 			}
 		case <-mergeTick.C:
+			if !n.repl.Ready() {
+				continue
+			}
+
 			if err := n.Merge(ctx); err != nil {
 				n.lg.Error("merge", zap.Error(err))
 			}
@@ -189,7 +191,7 @@ func (n *Node) Ingest(ctx context.Context, logs slog.Logs) (accepted, rejected i
 		return 0, 0, err
 	}
 
-	if n.engine.HeadRecords() >= n.opts.FlushRecords {
+	if n.repl.Ready() && n.engine.HeadRecords() >= n.opts.FlushRecords {
 		if err := n.Flush(ctx); err != nil {
 			// The records are durable in the WAL and still queryable from the head; a failed
 			// flush delays replication but loses nothing.

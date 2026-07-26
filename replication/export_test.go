@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// StartForTest runs the join phase alone, so a test can then drive the loop a step at a time
+// instead of running it.
+func StartForTest[B Block](ctx context.Context, r *Replication[B]) error { return r.start(ctx) }
+
 // PullForTest runs one log-pull pass. Tests drive the loop step by step instead of waiting on
 // the poll ticker, so they are deterministic and fast.
 func PullForTest[B Block](ctx context.Context, r *Replication[B]) error { return r.pull(ctx) }

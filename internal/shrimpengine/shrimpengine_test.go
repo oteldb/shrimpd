@@ -66,7 +66,6 @@ func newNode(t *testing.T, space *memkv.Space, name string) *node {
 		PollInterval: 10 * time.Millisecond,
 	})
 	require.NoError(t, err)
-	require.NoError(t, repl.Start(t.Context()))
 
 	// Stop the loop and wait for it before the test finishes: a zaptest logger must not be
 	// written to once its test has completed.
@@ -83,6 +82,11 @@ func newNode(t *testing.T, space *memkv.Space, name string) *node {
 		cancel()
 		<-done
 	})
+
+	// Run joins the cluster asynchronously, so wait for it: a test that committed a part before
+	// the replica had registered would be racing its own setup.
+	require.Eventually(t, repl.Ready, 20*time.Second, time.Millisecond,
+		"replication never became ready")
 
 	return &node{name: name, addr: addr, engine: engine, repl: repl}
 }

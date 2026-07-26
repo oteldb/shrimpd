@@ -139,7 +139,7 @@ func TestRestartMidQueueResumes(t *testing.T) {
 		Addr:    b.addr,
 	})
 	require.NoError(t, err)
-	require.NoError(t, restarted.Start(t.Context()))
+	require.NoError(t, replication.StartForTest(t.Context(), restarted))
 
 	require.Len(t, restarted.Inspect().Queue, 4, "outstanding work must survive a restart")
 
@@ -276,7 +276,7 @@ func TestNewReplicaWaitsForAnOfflinePeer(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, joiner.Start(t.Context()),
+	require.NoError(t, replication.StartForTest(t.Context(), joiner),
 		"a peer being temporarily down must not prevent startup")
 	require.True(t, joiner.AwaitingClone(), "the replica must know it is not yet usable")
 
@@ -297,7 +297,7 @@ func TestNewReplicaWaitsForAnOfflinePeer(t *testing.T) {
 		Addr:    a.addr,
 	})
 	require.NoError(t, err)
-	require.NoError(t, revived.Start(t.Context()))
+	require.NoError(t, replication.StartForTest(t.Context(), revived))
 	require.Equal(t, []string{want}, a.store.keys())
 
 	c.nodes["a"] = &node{name: "a", addr: a.addr, kv: revivedKV, store: a.store, repl: revived}
@@ -332,7 +332,7 @@ func TestExistingReplicaStartsWithoutPeers(t *testing.T) {
 		Addr:    a.addr,
 	})
 	require.NoError(t, err)
-	require.NoError(t, restarted.Start(t.Context()),
+	require.NoError(t, replication.StartForTest(t.Context(), restarted),
 		"a replica with sound local state must not need a peer to start")
 
 	require.Equal(t, []string{want}, a.store.keys())
