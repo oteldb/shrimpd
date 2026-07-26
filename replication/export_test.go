@@ -65,3 +65,22 @@ func LogRecordsForTest[B Block](ctx context.Context, r *Replication[B]) (int, er
 
 	return len(values), err
 }
+
+// ApplyForTest executes one record directly, bypassing the queue — the way a crash-restarted
+// replica re-runs work it may already have done.
+func ApplyForTest[B Block](ctx context.Context, r *Replication[B], rec Record[B]) error {
+	return r.apply(ctx, rec)
+}
+
+// TrimLogForTest erases every log record while leaving the head sequence intact, reproducing a
+// replica that has fallen behind the retained window.
+func TrimLogForTest[B Block](ctx context.Context, r *Replication[B]) error {
+	_, err := r.kv.Txn(ctx, Txn{Then: []Op{DeletePrefix(r.logDir())}})
+
+	return err
+}
+
+// UnmarshalRecordForTest exposes log-record decoding to the fuzzer.
+func UnmarshalRecordForTest[B Block](data []byte) (Record[B], error) {
+	return unmarshalRecord[B](data)
+}

@@ -2,6 +2,7 @@ package shrimpengine_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -305,6 +306,87 @@ func TestBodyContainsFiltersCaseInsensitively(t *testing.T) {
 			require.True(t, ok)
 		}
 	}
+}
+
+// TestConcurrentInstallsKeepEveryPart is the regression test for a lost-update race: replication
+// executes non-conflicting queue entries concurrently, and each install rewrites the partition's
+// bucket index. Without serializing that read-modify-write, two installs each load the index, add
+// their own entry and save — and one part vanishes, silently, only under the right timing.
+//
+// It installs many parts at once and requires every one of them to survive.
+func TestConcurrentInstallsKeepEveryPart(t *testing.T) {
+	t.Parallel()
+
+	space := memkv.NewSpace()
+	writer := newNode(t, space, "w")
+	reader := newNode(t, space, "r")
+
+	const parts = 12
+
+	want := make([]string, 0, parts)
+
+	for i := range parts {
+		writer.ingest(t, int64(1000+i*100), fmt.Sprintf("record-%02d", i))
+
+		part, ok, err := writer.engine.Flush(t.Context())
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		want = append(want, fmt.Sprintf("record-%02d", i))
+
+		require.NoError(t, writer.repl.Commit(t.Context(), part))
+	}
+
+	// Every record must be readable, which can only happen if the index names every part.
+	reader.waitForBodies(t, want)
+
+	store := shrimpengine.NewStore(reader.engine, nil, nil)
+
+	local, err := store.Local(t.Context())
+	require.NoError(t, err)
+
+	held := 0
+
+	for _, p := range local {
+		if p.Partition() == "w" {
+			held++
+		}
+	}
+
+	require.Equal(t, parts, held, "every concurrently installed part must appear in the index")
+}
+
+// TestDropRemovesObjectsAndIndexEntry checks both halves of a drop: the part stops being
+// referenced *and* its objects go, so a superseded part does not leak disk forever.
+func TestDropRemovesObjectsAndIndexEntry(t *testing.T) {
+	t.Parallel()
+
+	space := memkv.NewSpace()
+	a := newNode(t, space, "a")
+
+	a.ingest(t, 1000, "doomed")
+
+	part, ok, err := a.engine.Flush(t.Context())
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	keys, err := a.engine.Backend().List(t.Context(), part.Prefix()+"/")
+	require.NoError(t, err)
+	require.NotEmpty(t, keys)
+
+	store := shrimpengine.NewStore(a.engine, nil, nil)
+	require.NoError(t, store.Drop(t.Context(), part))
+
+	remaining, err := a.engine.Backend().List(t.Context(), part.Prefix()+"/")
+	require.NoError(t, err)
+	require.Empty(t, remaining, "a dropped part must not leave its objects behind")
+
+	local, err := store.Local(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, local)
+
+	// Dropping again must be a no-op, since replication retries entries it may already have run.
+	require.NoError(t, store.Drop(t.Context(), part))
 }
 
 func TestRecoversHeadFromWALAcrossRestart(t *testing.T) {

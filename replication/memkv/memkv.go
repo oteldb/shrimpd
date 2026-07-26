@@ -101,11 +101,14 @@ func (st *Store) ListFrom(_ context.Context, prefix, start string, limit int) ([
 	return out, nil
 }
 
-// checkDisjoint rejects a transaction whose operations touch the same key or overlapping ranges.
+// checkDisjoint rejects a transaction whose operations conflict, matching etcd's rule exactly:
+// two writes to one key conflict, and a write inside a delete's range conflicts, but deletes
+// never conflict with each other.
 //
-// etcd refuses such a transaction ("duplicate key given in txn request"), and a fake that quietly
-// accepts it lets a bug pass every in-process test and fail only against a real cluster. So this
-// store is deliberately as strict as etcd.
+// etcd refuses a conflicting transaction ("duplicate key given in txn request"), and a fake that
+// quietly accepts one lets a bug pass every in-process test and fail only against a real cluster.
+// Being *stricter* than etcd is a bug too — it would reject transactions production allows — so
+// the rule is mirrored, not approximated. [kvtest] holds both implementations to it.
 func checkDisjoint(ops []replication.Op) error {
 	for i := range ops {
 		for j := i + 1; j < len(ops); j++ {
@@ -120,19 +123,33 @@ func checkDisjoint(ops []replication.Op) error {
 }
 
 func opsOverlap(a, b replication.Op) bool {
-	aRange := a.Kind == replication.OpDeletePrefix
-	bRange := b.Kind == replication.OpDeletePrefix
+	aDel, bDel := isDelete(a), isDelete(b)
 
 	switch {
-	case aRange && bRange:
-		return strings.HasPrefix(a.Key, b.Key) || strings.HasPrefix(b.Key, a.Key)
-	case aRange:
-		return strings.HasPrefix(b.Key, a.Key)
-	case bRange:
-		return strings.HasPrefix(a.Key, b.Key)
+	case aDel && bDel:
+		// Deletes are idempotent and commute, so any number of them may cover the same keys.
+		return false
+	case aDel:
+		return deleteCovers(a, b.Key)
+	case bDel:
+		return deleteCovers(b, a.Key)
 	default:
+		// Two writes to one key: the outcome would depend on order, so it is rejected.
 		return a.Key == b.Key
 	}
+}
+
+func isDelete(op replication.Op) bool {
+	return op.Kind == replication.OpDelete || op.Kind == replication.OpDeletePrefix
+}
+
+// deleteCovers reports whether a delete operation's range includes key.
+func deleteCovers(del replication.Op, key string) bool {
+	if del.Kind == replication.OpDeletePrefix {
+		return strings.HasPrefix(key, del.Key)
+	}
+
+	return del.Key == key
 }
 
 // Txn implements [replication.KV].

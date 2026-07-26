@@ -131,6 +131,25 @@ func (r *Replication[B]) pull(ctx context.Context) error {
 		return errors.Wrap(err, "list log")
 	}
 
+	if len(values) == 0 {
+		// Nothing readable past the pointer usually means "caught up" — but it means the same
+		// thing when the log has been trimmed entirely past this replica, which is not the same
+		// situation at all. The head tells them apart.
+		head, _, err := getUint(ctx, r.kv, r.logSeqKey())
+		if err != nil {
+			return err
+		}
+
+		if head > ptr {
+			r.lg.Warn("log trimmed past pointer; cloning",
+				zap.Uint64("pointer", ptr), zap.Uint64("head", head))
+
+			return r.recoverFromGap(ctx)
+		}
+
+		return nil
+	}
+
 	for _, v := range values {
 		seq, ok := parseSeq(v.Key)
 		if !ok || seq <= ptr {
@@ -141,15 +160,7 @@ func (r *Replication[B]) pull(ctx context.Context) error {
 			r.lg.Warn("log gap; replica fell behind retention, cloning",
 				zap.Uint64("want", ptr+1), zap.Uint64("got", seq))
 
-			if err := r.markLost(ctx); err != nil {
-				return errors.Wrap(err, "mark lost")
-			}
-
-			if err := r.recoverIfLost(ctx); err != nil {
-				return errors.Wrap(err, "clone after gap")
-			}
-
-			return nil
+			return r.recoverFromGap(ctx)
 		}
 
 		rec, err := unmarshalRecord[B](v.Data)
@@ -182,6 +193,8 @@ func (r *Replication[B]) pull(ctx context.Context) error {
 			return err
 		}
 
+		r.dropSuperseded(ctx, rec)
+
 		r.mu.Lock()
 		r.queue = append(r.queue, &entry[B]{
 			key:      r.queueKey(r.name, seq),
@@ -195,6 +208,85 @@ func (r *Replication[B]) pull(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// recoverFromGap handles a log this replica can no longer read from: it flags itself lost and
+// rebuilds from a peer. There is no incremental path out of a gap — the records that would have
+// explained the missing parts are gone.
+func (r *Replication[B]) recoverFromGap(ctx context.Context) error {
+	if err := r.markLost(ctx); err != nil {
+		return errors.Wrap(err, "mark lost")
+	}
+
+	if err := r.recoverIfLost(ctx); err != nil {
+		return errors.Wrap(err, "clone after gap")
+	}
+
+	// The clone rewrote the durable queue and pointer; adopt them.
+	if err := r.loadQueue(ctx); err != nil {
+		return errors.Wrap(err, "reload queue after clone")
+	}
+
+	return nil
+}
+
+// supersedes reports whether a newly arrived record makes an already queued one pointless.
+//
+// The log is ordered, so a later record that covers an earlier one is the last word: fetching the
+// superseded part would be wasted work at best, and at worst impossible — the replica that wrote
+// it has already merged it away and deleted it.
+func supersedes[B Block](newer, older Record[B]) bool {
+	if newer.Partition() != older.Partition() {
+		return false
+	}
+
+	if newer.Op == OpDrop {
+		// A drop names one exact block; it says nothing about a merge that spans it.
+		return Key(newer.Block) == Key(older.Block)
+	}
+
+	return ContainsOrEquals(newer.Range(), older.Range())
+}
+
+// dropSuperseded discards queued entries that rec has made pointless.
+//
+// Without this a replica can deadlock. Suppose it still owes a fetch of block 3 when the writer
+// merges 3 and 4 away and deletes both: the fetch can never succeed, and the merge that would
+// resolve it overlaps block 3, so the conflict rule blocks it behind the entry it would fix.
+// Discarding the covered entry is what breaks the cycle — and it is sound precisely because the
+// merge record already promises every row block 3 held.
+func (r *Replication[B]) dropSuperseded(ctx context.Context, rec Record[B]) {
+	r.mu.Lock()
+
+	var stale []*entry[B]
+
+	kept := r.queue[:0]
+
+	for _, e := range r.queue {
+		// An executing entry is left alone: its work is already in flight, and whatever it
+		// installs will be superseded on disk when rec is applied.
+		if e.status != statusExecuting && supersedes(rec, e.rec) {
+			stale = append(stale, e)
+
+			continue
+		}
+
+		kept = append(kept, e)
+	}
+
+	r.queue = kept
+	r.mu.Unlock()
+
+	for _, e := range stale {
+		r.lg.Debug("discarding superseded queue entry",
+			zap.String("entry", e.rec.String()), zap.String("superseded_by", rec.String()))
+
+		if _, err := r.kv.Txn(ctx, Txn{Then: []Op{Delete(e.key)}}); err != nil {
+			// Harmless: the entry is gone from memory, and a restart that reloads it will
+			// discard it again on the next pull.
+			r.lg.Warn("dequeue superseded entry", zap.Uint64("seq", e.seq), zap.Error(err))
+		}
+	}
 }
 
 // advance moves the durable pointer to seq, optionally enqueuing the record in the same
@@ -352,9 +444,20 @@ func (r *Replication[B]) apply(ctx context.Context, rec Record[B]) error {
 	}
 
 	if rec.Op == OpDrop {
+		// Drop the named block *and* anything it covers. A lagging replica may still hold the
+		// merge sources the dropped part replaced — the same rows under different names — and
+		// no later record will ever mention them, so this is the only chance to remove them.
+		victims := SupersededBy(local, rec.Block)
+
 		for _, b := range local {
 			if Key(b) == Key(rec.Block) {
-				return r.store.Drop(ctx, b)
+				victims = append(victims, b)
+			}
+		}
+
+		for _, b := range victims {
+			if err := r.store.Drop(ctx, b); err != nil {
+				return errors.Wrapf(err, "drop %s", Key(b))
 			}
 		}
 

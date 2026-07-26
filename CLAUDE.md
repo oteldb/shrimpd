@@ -25,8 +25,14 @@
 - **Block ranges decide obsolescence.** `Contains(a, b)` (interval covers + strictly higher level)
   is the only supersession rule. `recordengine.Merge` compacts *every* part into one, which is
   what keeps a single interval a sound description of coverage.
-- `memkv` intentionally mirrors etcd's restrictions (e.g. no range-delete plus a write inside that
-  range in one transaction). Do not relax it to make a test pass.
+- **A later log record cancels an earlier one it covers.** Without `dropSuperseded` a replica
+  deadlocks: a fetch of a block that has since been merged away can never succeed, and the merge
+  that would resolve it is blocked behind it by the range-conflict rule.
+- **A drop removes what the dropped block covered**, not just the exact key. A lagging replica may
+  still hold the merge sources the dropped part replaced, and no later record will mention them.
+- `memkv` mirrors etcd's transaction rules exactly — two writes to one key conflict, a write inside
+  a delete range conflicts, deletes never conflict with each other. Being *stricter* than etcd is
+  as much a bug as being laxer; `replication/kvtest` holds both implementations to the same suite.
 
 ## Commands
 - `go build ./cmd/...` builds all binaries.
@@ -40,6 +46,12 @@
 - `replication/` tests drive a multi-replica cluster in-process over `memkv` and step the loops
   explicitly (`PullForTest`/`ExecuteForTest` in `export_test.go`) instead of sleeping — keep new
   tests deterministic the same way.
+- `converge_test.go` is the property suite: randomized flush/merge/drop workloads over 50 seeds,
+  asserting convergence, no self-superseding parts, and exactly-once block coverage. A failure
+  prints the event sequence that produced it. Both queue bugs above were found here.
+- `chaos_test.go` injects transfer failures, a dying source, restarts mid-queue, and a trimmed log.
+- `replication/kvtest` is the shared KV conformance suite: run it against `memkv` (fast) and
+  against etcd in `e2e/kv_test.go`. Add anything replication relies on there, not to one side.
 - `internal/shrimpengine` tests run real HTTP part transport over `httptest`.
 - When a test starts `Replication.Run` in a goroutine with a `zaptest` logger, cancel and wait for
   it in `t.Cleanup`; logging after a test completes is a data race.

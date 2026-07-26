@@ -92,9 +92,10 @@ session-scoped ephemeral keys — six methods, in [`replication.KV`](./replicati
 | [`replication/etcdkv`](./replication/etcdkv) | etcd v3, ephemeral keys on a session lease |
 | [`replication/memkv`](./replication/memkv) | in-process; several sessions share one keyspace |
 
-`memkv` deliberately enforces etcd's rules (including its refusal to range-delete a prefix and
-write inside it in one transaction), so a bug cannot pass the fast tests and fail only in
-production.
+`memkv` mirrors etcd's transaction rules exactly — including its refusal to write inside a prefix
+the same transaction deletes — so a bug cannot pass the fast tests and fail only in production.
+[`replication/kvtest`](./replication/kvtest) is the one conformance suite both must pass; it runs
+against `memkv` in unit tests and against a real etcd in `e2e/`.
 
 ## The daemon
 
@@ -181,7 +182,12 @@ golangci-lint run ./...
 ```
 
 The replication tests run a multi-replica cluster in-process over `memkv` — no Docker, a few
-milliseconds. `e2e/` runs the same scenarios against real etcd and real HTTP.
+milliseconds. On top of the scenario tests there is a property suite (randomized flush/merge/drop
+workloads asserting convergence and exactly-once block coverage), fault injection (failed
+transfers, a dying source, restart mid-queue, a trimmed log), a fuzzer over log-record decoding,
+and `replication/kvtest`, one conformance suite run against both `memkv` and real etcd so the fake
+can never quietly diverge from the real thing. `e2e/` runs the daemon scenarios against etcd and
+real HTTP.
 
 ## License
 

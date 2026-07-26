@@ -54,6 +54,9 @@ type fakeStore struct {
 	failFetch bool
 	// refuseMerge makes Merge decline, forcing the fetch path.
 	refuseMerge bool
+	// beforeFetch, when set, runs before each Fetch and can fail it — the hook for injecting
+	// intermittent transfer failures.
+	beforeFetch func() error
 
 	fetched int
 	merged  int
@@ -104,11 +107,17 @@ func (s *fakeStore) Local(context.Context) ([]testBlock, error) {
 
 func (s *fakeStore) Fetch(_ context.Context, addr string, b testBlock) error {
 	s.mu.Lock()
-	fail := s.failFetch
+	fail, hook := s.failFetch, s.beforeFetch
 	s.mu.Unlock()
 
 	if fail {
 		return errors.New("fetch disabled")
+	}
+
+	if hook != nil {
+		if err := hook(); err != nil {
+			return err
+		}
 	}
 
 	peer, ok := s.peers.get(addr)
@@ -259,32 +268,70 @@ func (c *cluster) add(name string) *node {
 	return n
 }
 
-// converge runs pull+execute on every replica until nothing changes, or fails the test. It
-// replaces sleeping on the poll interval: the loops are the same, only the clock is not.
-func (c *cluster) converge() {
+// step runs exactly one pull+execute round on every replica — one tick of every node's Run loop,
+// with the clock removed.
+func (c *cluster) step() {
 	c.t.Helper()
 
 	ctx := c.t.Context()
+
+	for _, name := range sortedNames(c.nodes) {
+		n := c.nodes[name]
+
+		require.NoError(c.t, replication.PullForTest(ctx, n.repl))
+		replication.ExecuteForTest(ctx, n.repl)
+	}
+}
+
+// converge steps every replica until nothing changes, or fails the test. It replaces sleeping on
+// the poll interval: the loops are the same, only the clock is not.
+func (c *cluster) converge() {
+	c.t.Helper()
 
 	const maxRounds = 50
 
 	prev := ""
 
 	for range maxRounds {
-		for _, n := range c.nodes {
-			require.NoError(c.t, replication.PullForTest(ctx, n.repl))
-			replication.ExecuteForTest(ctx, n.repl)
-		}
+		c.step()
 
 		state := c.snapshot()
-		if state == prev {
+
+		// A stable part set is not convergence if work is still queued: an entry stuck in
+		// backoff leaves the snapshot unchanged while the replica is still behind.
+		if state == prev && c.queuesEmpty() {
 			return
 		}
 
 		prev = state
 	}
 
-	c.t.Fatalf("cluster did not converge; last state:\n%s", prev)
+	c.t.Fatalf("cluster did not converge; last state:\n%s\nqueues:\n%s", prev, c.queueState())
+}
+
+// queuesEmpty reports whether every replica has drained its queue.
+func (c *cluster) queuesEmpty() bool {
+	for _, n := range c.nodes {
+		if len(n.repl.Inspect().Queue) > 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// queueState renders what each replica still owes, for failure output.
+func (c *cluster) queueState() string {
+	var b []byte
+
+	for _, name := range sortedNames(c.nodes) {
+		for _, e := range c.nodes[name].repl.Inspect().Queue {
+			b = fmt.Appendf(b, "%s: %s %s (%s, attempts=%d) %s\n",
+				name, e.Op, e.Block, e.Status, e.Attempts, e.LastError)
+		}
+	}
+
+	return string(b)
 }
 
 // snapshot renders every replica's block set, for convergence detection and failure output.
@@ -323,7 +370,26 @@ func (n *node) flush(t *testing.T, partition string) testBlock {
 	return b
 }
 
-// merge simulates a local merge on n and announces it.
+// ownParts returns the blocks this node holds in its own partition, in block order — the set a
+// merge on this node would consume.
+func (n *node) ownParts() []testBlock {
+	blocks, _ := n.store.Local(context.Background())
+
+	var out []testBlock
+
+	for _, b := range blocks {
+		if b.Part == n.name {
+			out = append(out, b)
+		}
+	}
+
+	replication.SortBlocks(out)
+
+	return out
+}
+
+// merge simulates a local merge on n and announces it. The result must span every source and sit
+// strictly above all of them, which is what makes containment a sound obsolescence test.
 func (n *node) merge(t *testing.T, src ...testBlock) testBlock {
 	t.Helper()
 
@@ -334,8 +400,15 @@ func (n *node) merge(t *testing.T, src ...testBlock) testBlock {
 		R: replication.Range{
 			First: src[0].R.First,
 			Last:  src[len(src)-1].R.Last,
-			Level: src[0].R.Level + 1,
 		},
+	}
+
+	for _, s := range src {
+		require.Equal(t, dst.Part, s.Part, "a merge cannot span partitions")
+
+		dst.R.First = min(dst.R.First, s.R.First)
+		dst.R.Last = max(dst.R.Last, s.R.Last)
+		dst.R.Level = max(dst.R.Level, s.R.Level+1)
 	}
 
 	require.NoError(t, n.store.Merge(t.Context(), src, dst))

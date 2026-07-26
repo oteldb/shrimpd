@@ -60,6 +60,14 @@ type Cond struct {
 // nothing is. Committing a part is one Txn — the log record and the replica's part entry either
 // both appear or neither does, so a crash can never leave the log advertising a part no replica
 // claims to hold.
+//
+// The operations must not conflict, because their outcome would then depend on the order a store
+// happened to apply them in. Two writes to one key conflict, and a write inside a
+// [DeletePrefix] range conflicts; deletes never conflict with each other, being idempotent and
+// commutative. A store rejects a conflicting transaction with an error rather than applying it
+// (etcd: "duplicate key given in txn request"). Where a conflict is genuinely wanted — clearing a
+// subtree and repopulating it — use two transactions and order them so the intermediate state is
+// safe.
 type Txn struct {
 	If   []Cond
 	Then []Op
