@@ -232,7 +232,10 @@ func (s *Store) reload(ctx context.Context, partition string) error {
 		return nil
 	}
 
-	if err := eng.LoadParts(ctx); err != nil {
+	// RefreshReplica, not LoadParts: LoadParts sweeps every object the partition index does not
+	// name, and a part that a concurrent fetch has copied but not yet published has exactly that
+	// shape. Sweeping it would leave the part referenced by the index but unreadable, forever.
+	if err := eng.RefreshReplica(ctx); err != nil {
 		return errors.Wrapf(err, "reload parts of %q", partition)
 	}
 

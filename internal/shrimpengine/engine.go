@@ -216,7 +216,9 @@ func (e *Engine) partitionEngine(ctx context.Context, partition string) (*record
 	e.parts[partition] = eng
 	e.mu.Unlock()
 
-	if err := eng.LoadParts(ctx); err != nil {
+	// A peer partition is a replica view, so it is loaded without the orphan sweep for the same
+	// reason [Store.reload] is: objects of a part still being fetched are not in the index yet.
+	if err := eng.RefreshReplica(ctx); err != nil {
 		return nil, errors.Wrapf(err, "load parts of %q", partition)
 	}
 
