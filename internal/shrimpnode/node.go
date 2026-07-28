@@ -127,6 +127,11 @@ func (n *Node) Engine() *shrimpengine.Engine { return n.engine }
 // Replication exposes the replication state, for operator endpoints.
 func (n *Node) Replication() *replication.Replication[shrimpengine.Part] { return n.repl }
 
+// Ready reports whether the node has joined the cluster and may produce parts. It is false until
+// [Node.Run] has finished joining, and again whenever replication finds it must rebuild — unlike
+// [State.AwaitingClone], which only distinguishes the second case.
+func (n *Node) Ready() bool { return n.repl.Ready() }
+
 // Close flushes and releases the local store.
 func (n *Node) Close(ctx context.Context) error { return n.engine.Close(ctx) }
 
@@ -266,6 +271,8 @@ type State struct {
 	Parts       []shrimpengine.Part `json:"parts"`
 	Replication replication.State   `json:"replication"`
 	LagRecords  uint64              `json:"lag_records"`
+	// Ready is true once the node has joined the cluster and may flush and announce parts.
+	Ready bool `json:"ready"`
 	// AwaitingClone is true while this node must rebuild from a peer but none is reachable. It
 	// holds untrustworthy data and is not serving the cluster until it clears.
 	AwaitingClone bool `json:"awaiting_clone"`
@@ -290,6 +297,7 @@ func (n *Node) Inspect(ctx context.Context) (State, error) {
 		Parts:         parts,
 		Replication:   n.repl.Inspect(),
 		LagRecords:    lag,
+		Ready:         n.repl.Ready(),
 		AwaitingClone: n.repl.AwaitingClone(),
 	}, nil
 }

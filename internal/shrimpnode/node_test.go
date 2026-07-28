@@ -53,15 +53,31 @@ func newNode(t *testing.T, space *memkv.Space, id string) (*shrimpnode.Node, *me
 }
 
 // waitReady blocks until the node has joined the cluster.
+//
+// Run joins asynchronously, and a node that has not started yet is not awaiting a clone either —
+// so readiness, not the absence of a clone wait, is what a caller must gate on before treating the
+// node as a member of the cluster.
 func waitReady(t *testing.T, n *shrimpnode.Node) {
+	t.Helper()
+
+	require.Eventually(t, n.Ready, 20*time.Second, 5*time.Millisecond, "node never joined")
+}
+
+// waitLogged blocks until the node's replication has a log record to show for its parts.
+//
+// [Node.Flush] is not the only thing that announces: the maintenance loop flushes on its own
+// timer, so a Flush that returns nil may mean the loop got there first and is still committing.
+// A test that goes on to bring up a node which must find a non-empty log has to wait for the
+// record itself, not for the call.
+func waitLogged(t *testing.T, n *shrimpnode.Node) {
 	t.Helper()
 
 	require.Eventually(t, func() bool {
 		state, err := n.Inspect(t.Context())
 		require.NoError(t, err)
 
-		return !state.AwaitingClone
-	}, 20*time.Second, 5*time.Millisecond, "node never joined")
+		return state.Replication.Pointer > 0
+	}, 20*time.Second, 5*time.Millisecond, "nothing was ever announced to the log")
 }
 
 func ingest(t *testing.T, n *shrimpnode.Node, ts int64, body string) {
@@ -113,6 +129,7 @@ func TestMaintenanceWaitsUntilTheNodeHasJoined(t *testing.T) {
 
 	ingest(t, seed, 1000, "from-seed")
 	require.NoError(t, seed.Flush(t.Context()))
+	waitLogged(t, seed)
 
 	// The only peer goes offline: the newcomer will have nothing to clone from.
 	require.NoError(t, seedKV.Close())
