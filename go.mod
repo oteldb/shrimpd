@@ -7,7 +7,7 @@ require (
 	github.com/ClickHouse/ch-go v0.73.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/go-faster/jx v1.2.0
-	github.com/go-faster/sdk v0.37.0
+	github.com/go-faster/sdk v0.38.0
 	github.com/oteldb/storage v0.36.0
 	github.com/samber/slog-zap/v2 v2.7.0
 	github.com/stretchr/testify v1.11.1
@@ -26,7 +26,7 @@ require (
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/go-logr/zapr v1.3.0 // indirect
 	github.com/grafana/otel-profiling-go v0.6.0 // indirect
-	github.com/grafana/pyroscope-go v1.3.1 // indirect
+	github.com/grafana/pyroscope-go v1.4.1 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.11 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/maypok86/otter/v2 v2.3.0 // indirect
@@ -139,7 +139,7 @@ require (
 	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260622175928-b703f567277d // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260622175928-b703f567277d // indirect
-	google.golang.org/grpc v1.82.1 // indirect
+	google.golang.org/grpc v1.83.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
