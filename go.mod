@@ -8,7 +8,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/go-faster/jx v1.2.0
 	github.com/go-faster/sdk v0.37.0
-	github.com/oteldb/storage v0.34.0
+	github.com/oteldb/storage v0.36.0
 	github.com/samber/slog-zap/v2 v2.7.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.43.0
