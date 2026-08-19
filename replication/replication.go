@@ -106,6 +106,11 @@ type Replication[B Block] struct {
 	// the log-sequence compare-and-swap and retry each other for nothing.
 	commitMu sync.Mutex
 
+	// publishMu serializes this replica's part-set reconciliation. publishLocalParts computes a
+	// diff between the store and the published set, so two concurrent passes can interleave into
+	// a delete of a part the other one has just installed.
+	publishMu sync.Mutex
+
 	// started is set once Run has finished joining the cluster; awaitingClone is set while the
 	// replica is lost and has no healthy peer to rebuild from. Together they are [Ready]:
 	// until then the replica's view is incomplete or known-wrong, and it must not act as if it
@@ -383,6 +388,9 @@ func (r *Replication[B]) append(ctx context.Context, rec Record[B]) error {
 // reconciliation rather than an incremental update, so a part restored or removed outside
 // replication is still reflected.
 func (r *Replication[B]) publishLocalParts(ctx context.Context) error {
+	r.publishMu.Lock()
+	defer r.publishMu.Unlock()
+
 	local, err := r.store.Local(ctx)
 	if err != nil {
 		return errors.Wrap(err, "list local blocks")
