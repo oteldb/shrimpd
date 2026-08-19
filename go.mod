@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/CAFxX/httpcompression v0.0.9
-	github.com/ClickHouse/ch-go v0.73.0
+	github.com/ClickHouse/ch-go v0.74.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/go-faster/jx v1.2.0
 	github.com/go-faster/sdk v0.37.0
