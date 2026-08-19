@@ -121,11 +121,16 @@ func (n *node) ingest(t *testing.T, base int64, bodies ...string) {
 }
 
 // bodies returns every record the node can see, sorted, across all partitions.
-func (n *node) bodies(t *testing.T) []string {
+//
+// It returns the error instead of failing: a poll may catch the part directory mid-drop, which
+// on Windows is a sharing violation rather than a missing file.
+func (n *node) bodies(t *testing.T) ([]string, error) {
 	t.Helper()
 
 	entries, err := n.engine.Query(t.Context(), 0, 1<<62, nil, 0)
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
@@ -134,7 +139,7 @@ func (n *node) bodies(t *testing.T) []string {
 
 	slices.Sort(out)
 
-	return out
+	return out, nil
 }
 
 // waitForBodies polls until the node sees exactly want, or fails.
@@ -143,16 +148,21 @@ func (n *node) waitForBodies(t *testing.T, want []string) {
 
 	deadline := time.Now().Add(20 * time.Second)
 
-	var got []string
+	var (
+		got     []string
+		lastErr error
+	)
 
 	for time.Now().Before(deadline) {
-		if got = n.bodies(t); slices.Equal(got, want) {
+		got, lastErr = n.bodies(t)
+		if lastErr == nil && slices.Equal(got, want) {
 			return
 		}
 
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	require.NoError(t, lastErr, "node %s never converged", n.name)
 	require.Equal(t, want, got, "node %s never converged", n.name)
 }
 
@@ -231,9 +241,15 @@ func TestMergedPartSupersedesSourcesOnPeer(t *testing.T) {
 	// b fetches the merged part and drops the three sources; the data is unchanged.
 	b.waitForBodies(t, want)
 
+	// A list that catches the parts directory mid-drop is a retry, not a failure: on Windows
+	// walking a directory being deleted is a sharing violation.
 	require.Eventually(t, func() bool {
 		local, err := shrimpengine.NewStore(b.engine, nil, nil).Local(t.Context())
-		require.NoError(t, err)
+		if err != nil {
+			t.Logf("list local parts: %v", err)
+
+			return false
+		}
 
 		count := 0
 
