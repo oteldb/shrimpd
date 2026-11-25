@@ -97,12 +97,13 @@ func (s *Store) Fetch(ctx context.Context, addr string, p Part) error {
 		}
 	}
 
-	// The part's columns are meaningless without the partition's stream identity index: a part
-	// stores rows keyed by stream id, and only this object maps an id back to the resource and
-	// scope that identify it. It lives beside the parts rather than inside one and grows as new
-	// streams appear, so it is re-copied on every fetch — and always *before* the bucket index
-	// makes the part visible, so a reader never resolves a row to an identity that is not there.
+	// Some older parts still resolve stream identities through the partition's streams.bin.
 	if err := s.fetchStreams(ctx, addr, p.Node); err != nil {
+		return err
+	}
+
+	// A peer may have recovered this descriptor from its index after losing the sidecar.
+	if err := s.engine.writeBlock(ctx, p); err != nil {
 		return err
 	}
 
@@ -182,7 +183,8 @@ func (s *Store) unreference(ctx context.Context, p Part, indexKey string) error 
 	s.indexMu.Lock()
 	defer s.indexMu.Unlock()
 
-	ix, err := s.engine.index(ctx, p.Node)
+	be := s.engine.Backend()
+	ix, version, err := bucketindex.LoadVersioned(ctx, be, indexKey)
 	if err != nil {
 		return err
 	}
@@ -191,7 +193,7 @@ func (s *Store) unreference(ctx context.Context, p Part, indexKey string) error 
 		return nil
 	}
 
-	if err := ix.Save(ctx, s.engine.Backend(), indexKey); err != nil {
+	if _, err := ix.Save(ctx, be, indexKey, version); err != nil {
 		return errors.Wrapf(err, "save index of %q", p.Node)
 	}
 
@@ -205,14 +207,15 @@ func (s *Store) publish(ctx context.Context, p Part) error {
 	s.indexMu.Lock()
 	defer s.indexMu.Unlock()
 
-	ix, err := s.engine.index(ctx, p.Node)
+	be := s.engine.Backend()
+	ix, version, err := bucketindex.LoadVersioned(ctx, be, indexKey)
 	if err != nil {
 		return err
 	}
 
 	ix.Add(bucketindex.Entry{Prefix: p.Prefix(), MinTime: p.MinTime, MaxTime: p.MaxTime})
 
-	if err := ix.Save(ctx, s.engine.Backend(), indexKey); err != nil {
+	if _, err := ix.Save(ctx, be, indexKey, version); err != nil {
 		return errors.Wrapf(err, "save index of %q", p.Node)
 	}
 

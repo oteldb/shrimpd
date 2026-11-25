@@ -115,9 +115,8 @@ func TestRunJoinsWithoutASeparateStartStep(t *testing.T) {
 // TestMaintenanceWaitsUntilTheNodeHasJoined is the reason readiness is exposed at all.
 //
 // A node whose replication has not yet established its place in the cluster must not flush and
-// announce parts. Its record engine names parts from a node-local counter, so a node that came up
-// with an empty disk would restart that counter at zero and announce a part under a name its peers
-// already hold for entirely different rows — two replicas disagreeing on what one part key means.
+// announce parts. Its record engine allocates block numbers from the local index, so a node
+// without that index could reuse a range that its peers already hold for different rows.
 func TestMaintenanceWaitsUntilTheNodeHasJoined(t *testing.T) {
 	t.Parallel()
 

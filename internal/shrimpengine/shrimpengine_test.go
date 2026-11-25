@@ -179,7 +179,9 @@ func TestFlushedPartReplicatesToPeer(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, "a", part.Partition())
-	require.Equal(t, replication.Range{First: 0, Last: 0, Level: 0}, part.Range())
+	require.NotEmpty(t, part.ID)
+	require.Equal(t, part.Range().First, part.Range().Last)
+	require.Zero(t, part.Range().Level)
 
 	require.NoError(t, a.repl.Commit(t.Context(), part))
 

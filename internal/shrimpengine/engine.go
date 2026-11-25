@@ -6,10 +6,8 @@
 // leaves to its embedder:
 //
 //   - **Partitioning by writer.** Every node writes only into its own partition, which is a
-//     separate record engine under the key prefix `{nodeID}/`. A record engine names its parts
-//     from a node-local counter, so confining writes to one node per partition is what makes a
-//     part's key identical on every replica — which in turn is what lets replication copy a part's
-//     objects verbatim instead of re-encoding them.
+//     separate record engine under the key prefix `{nodeID}/`. Replicas copy part objects under
+//     the keys assigned by the writer's record engine.
 //   - **A block descriptor per part.** The engine records a part's key and time range; shrimpd
 //     writes a sidecar recording its logical block coverage, which is what [replication] needs to
 //     decide that a merged part supersedes its sources.
@@ -23,7 +21,6 @@ import (
 	"encoding/json"
 	"io"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -115,7 +112,7 @@ func Open(ctx context.Context, o Options) (*Engine, error) {
 		return nil, errors.Wrap(err, "load own parts")
 	}
 
-	if err := own.Replay(path.Join(o.Dir, "wal")); err != nil {
+	if err := own.Replay(ctx, path.Join(o.Dir, "wal")); err != nil {
 		return nil, errors.Wrap(err, "replay wal")
 	}
 
@@ -315,9 +312,11 @@ func (e *Engine) Flush(ctx context.Context) (Part, bool, error) {
 		return Part{}, false, nil
 	}
 
-	entry := added[0]
+	p, err := partFromIndex(e.node, added[0])
+	if err != nil {
+		return Part{}, false, err
+	}
 
-	p := flushed(e.node, seqOf(entry.Prefix), entry.MinTime, entry.MaxTime)
 	if err := e.writeBlock(ctx, p); err != nil {
 		return Part{}, false, err
 	}
@@ -354,9 +353,12 @@ func (e *Engine) Merge(ctx context.Context, retainFrom int64) (merged Part, sour
 		return Part{}, nil, false, nil
 	}
 
-	entry := added[0]
+	p, err := partFromIndex(e.node, added[0])
+	if err != nil {
+		return Part{}, nil, false, err
+	}
 
-	merged = mergedFrom(e.node, seqOf(entry.Prefix), removed, entry.MinTime, entry.MaxTime)
+	merged = mergedFrom(p, removed)
 	if err := e.writeBlock(ctx, merged); err != nil {
 		return Part{}, nil, false, err
 	}
@@ -456,11 +458,10 @@ func (e *Engine) partsOf(ctx context.Context, partition string) ([]Part, error) 
 	for _, entry := range ix.Entries {
 		p, err := e.readBlock(ctx, entry.Prefix)
 		if err != nil {
-			// A part without a descriptor was written by a version that did not keep one, or
-			// its sidecar was lost. Reconstruct the conservative equivalent: a level-0 part
-			// covering its own sequence, which supersedes nothing and is superseded by any
-			// merge spanning it.
-			p = flushed(partition, seqOf(entry.Prefix), entry.MinTime, entry.MaxTime)
+			p, err = partFromIndex(partition, entry)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		out = append(out, p)
@@ -570,16 +571,6 @@ func (e *Engine) SyncWAL() error {
 	}
 
 	return nil
-}
-
-// seqOf parses the numeric last component of a part key prefix.
-func seqOf(prefix string) int {
-	n, err := strconv.Atoi(path.Base(prefix))
-	if err != nil {
-		return 0
-	}
-
-	return n
 }
 
 // partitionOf returns the partition component of a backend key — everything before the first

@@ -2,6 +2,11 @@ package shrimpengine
 
 import (
 	"fmt"
+	"path"
+	"strconv"
+
+	"github.com/go-faster/errors"
+	"github.com/oteldb/storage/backend/bucketindex"
 
 	"github.com/oteldb/shrimpd/replication"
 )
@@ -12,24 +17,19 @@ import (
 // it alongside the part and copies it with the rest of the part's objects.
 const blockObject = "shrimp-block.json"
 
-// streamsObject is the record engine's per-partition stream identity index. It is not part of any
-// single part but every part depends on it, so replication copies it alongside them.
+// streamsObject is the legacy per-partition stream identity index.
 const streamsObject = "streams.bin"
 
 // Part is shrimpd's replicated unit: one immutable record-engine part.
 //
-// Two identities live here and they are deliberately different. `Seq` is the *physical* name —
-// the numeric key component the record engine gave the part, which is what a peer copies objects
-// under. `First`/`Last`/`Level` are the *logical* coverage used for obsolescence: a flushed part
-// covers the single block number equal to its sequence at level 0, and a merge covers the union
-// of its sources at one level higher. Keeping them apart is what lets shrimpd replicate parts the
-// engine named for itself while still reasoning about them the way ClickHouse does.
+// ID (or Seq for older parts) identifies the objects to copy. First, Last and Level describe
+// the logical block range used by replication.
 type Part struct {
-	// Node is the partition: the id of the node that wrote this part. Each node writes only its
-	// own partition, so the engine's node-local sequence allocation is unambiguous cluster-wide
-	// and a part's objects live under the same key on every replica.
+	// Node is the id of the node that owns this partition.
 	Node string `json:"node"`
-	// Seq is the record engine's part sequence, and the last component of its key prefix.
+	// ID is the opaque part name assigned by the record engine.
+	ID string `json:"id,omitempty"`
+	// Seq is the numeric name carried by older sidecars and replication records.
 	Seq int `json:"seq"`
 
 	First uint64 `json:"first"`
@@ -42,9 +42,14 @@ type Part struct {
 
 var _ replication.Block = Part{}
 
-// Name is the part's physical name — the numeric key component, zero-padded exactly as the
-// record engine writes it.
-func (p Part) Name() string { return fmt.Sprintf("%010d", p.Seq) }
+// Name returns the last component of the part's object prefix.
+func (p Part) Name() string {
+	if p.ID != "" {
+		return p.ID
+	}
+
+	return fmt.Sprintf("%010d", p.Seq)
+}
 
 // Partition returns the owning node's id.
 func (p Part) Partition() string { return p.Node }
@@ -54,33 +59,43 @@ func (p Part) Range() replication.Range {
 	return replication.Range{First: p.First, Last: p.Last, Level: p.Level}
 }
 
-// Prefix is the backend key prefix holding this part's objects, e.g. "node1/0000000007".
+// Prefix is the backend key prefix holding this part's objects.
 func (p Part) Prefix() string { return p.Node + "/" + p.Name() }
 
 // Overlaps reports whether the part can contain records in the inclusive window.
 func (p Part) Overlaps(from, to int64) bool { return p.MinTime <= to && p.MaxTime >= from }
 
-// flushed builds the descriptor for a freshly written part: it covers the one block number its
-// sequence names.
-func flushed(node string, seq int, minTime, maxTime int64) Part {
-	return Part{
-		Node:    node,
-		Seq:     seq,
-		First:   uint64(seq),
-		Last:    uint64(seq),
-		Level:   0,
-		MinTime: minTime,
-		MaxTime: maxTime,
+// The old engine used signed sequences. The new allocator starts at one independently of
+// those sequences, so reserve the upper half of the range for its block numbers.
+const storageBlockBase uint64 = 1 << 63
+
+// partFromIndex describes a new part or reconstructs a missing sidecar from the index.
+func partFromIndex(node string, entry bucketindex.Entry) (Part, error) {
+	p := Part{Node: node, MinTime: entry.MinTime, MaxTime: entry.MaxTime}
+	name := path.Base(entry.Prefix)
+	if seq, err := strconv.Atoi(name); err == nil && seq >= 0 && fmt.Sprintf("%010d", seq) == name {
+		p.Seq = seq
+		p.First, p.Last = uint64(seq), uint64(seq)
+		return p, nil
 	}
+
+	blocks := entry.Blocks
+	if !blocks.Valid() || blocks.Min.Term != 0 || blocks.Max.Term != 0 || blocks.Max.N >= storageBlockBase {
+		return Part{}, errors.Errorf("part %q has no supported block range", entry.Prefix)
+	}
+
+	p.ID = name
+	p.First = storageBlockBase + blocks.Min.N
+	p.Last = storageBlockBase + blocks.Max.N
+	p.Level = uint64(entry.Level)
+
+	return p, nil
 }
 
-// mergedFrom builds the descriptor for a merged part. The record engine compacts *every* live
-// part into one, so the sources are exactly the partition's previous contents and the result
-// covers their whole block interval with nothing surviving inside it — which is what makes plain
-// interval containment a sound obsolescence test.
-func mergedFrom(node string, seq int, sources []Part, minTime, maxTime int64) Part {
-	p := Part{Node: node, Seq: seq, MinTime: minTime, MaxTime: maxTime}
-
+// mergedFrom sets the range of a merge output from its sources, including legacy coverage
+// recorded only in shrimpd's sidecars.
+func mergedFrom(p Part, sources []Part) Part {
+	p.Level = 0
 	for i, s := range sources {
 		if i == 0 || s.First < p.First {
 			p.First = s.First
