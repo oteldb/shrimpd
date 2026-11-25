@@ -106,19 +106,17 @@ against `memkv` in unit tests and against a real etcd in `e2e/`.
 `shrimpd` is a log store built on the above: `oteldb/storage`'s record engine for the data,
 `replication` for the cluster.
 
-**Each node writes only its own partition.** A record engine names parts from a node-local
-counter, so confining writes to one writer per partition is what makes a part's object keys
-identical on every replica — which is what lets replication copy those objects verbatim instead
-of re-encoding them. A node holds one writable engine and a read-only engine per peer partition;
-queries fan out across all of them.
+**Each node writes only its own partition.** Replication copies each part's objects under the
+keys assigned by the writer's record engine. A node holds one writable engine and a read-only
+engine per peer partition. Queries fan out across all of them.
 
 ```
 <dataDir>/
   wal/                             write-ahead log (storage/wal)
   parts/
     <node>/bucket-index.bin        the part list — written last, the commit point
-    <node>/streams.bin             stream identity index
-    <node>/<seq>/…                 one immutable part's column objects
+    <node>/streams.bin             optional legacy stream identity index
+    <node>/<part-id>/…             one immutable part's objects
 ```
 
 ### Binaries
