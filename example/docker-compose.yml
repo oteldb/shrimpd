@@ -41,11 +41,28 @@ services:
         limits:
           cpus: '0.5'
           memory: 128M
+  otelcol:
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.154.0
+    command: [ "--config=/etc/otelcol/config.yaml" ]
+    volumes:
+      - ./otelcol.yaml:/etc/otelcol/config.yaml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      gateway:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
   shrimpd-1:
     build: ..
     image: oteldb/shrimpd:latest
     environment:
-      - OTEL_LOGS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=otlp
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
     command:
       - -id=shrimpd-1
       - -addr=shrimpd-1:8080
@@ -71,7 +88,8 @@ services:
     build: ..
     image: oteldb/shrimpd:latest
     environment:
-      - OTEL_LOGS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=otlp
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
     command:
       - -id=shrimpd-2
       - -addr=shrimpd-2:8080
@@ -97,7 +115,8 @@ services:
     build: ..
     image: oteldb/shrimpd:latest
     environment:
-      - OTEL_LOGS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=otlp
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
     command:
       - -id=shrimpd-3
       - -addr=shrimpd-3:8080
